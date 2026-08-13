@@ -1,0 +1,121 @@
+name: CallApp privacy reproduction
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'callapp_privacy_audit.py'
+      - '.github/workflows/callapp-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download research tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p tools
+          curl -L --fail --retry 4 \
+            -o tools/apkeep \
+            https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
+          chmod +x tools/apkeep
+          tools/apkeep --version | tee apkeep-version.txt
+
+          curl -L --fail --retry 4 \
+            -o tools/jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q tools/jadx.zip -d tools/jadx
+          tools/jadx/bin/jadx --version | tee jadx-version.txt
+
+      - name: List CallApp versions
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs downloads/old downloads/current
+          tools/apkeep -l -a com.callapp.contacts -d apk-pure 2>&1 | tee logs/available-versions.txt
+
+      - name: Download known-positive and current samples
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tools/apkeep -a com.callapp.contacts@2.094 -d apk-pure downloads/old 2>&1 | tee logs/download-old.txt
+          tools/apkeep -a com.callapp.contacts -d apk-pure downloads/current 2>&1 | tee logs/download-current.txt
+          find downloads -type f -maxdepth 3 -printf '%p %s bytes\n' | sort | tee logs/downloaded-files.txt
+          find downloads -type f -exec sha256sum {} + | sort | tee logs/download-sha256.txt
+
+      - name: Identify samples and run JADX audit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OLD="$(find downloads/old -type f | sort | head -1)"
+          CURRENT="$(find downloads/current -type f | sort | head -1)"
+          test -n "$OLD" && test -n "$CURRENT"
+          printf 'OLD=%s\nCURRENT=%s\n' "$OLD" "$CURRENT" | tee logs/selected-samples.txt
+          python3 callapp_privacy_audit.py \
+            --sample old_2.094="$OLD" \
+            --sample current_latest="$CURRENT" \
+            --jadx tools/jadx/bin/jadx \
+            --timeout 3000 \
+            --output results \
+            2>&1 | tee logs/audit-run.txt
+
+      - name: Preserve only source files cited by the audit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+
+          root = Path('results')
+          evidence = json.loads((root / 'evidence.json').read_text())
+          copied = []
+          for row in evidence:
+              if row.get('source') != 'jadx':
+                  continue
+              label = row['sample']
+              rel = Path(row['location'])
+              src = root / label / 'jadx' / rel
+              if not src.is_file():
+                  continue
+              dst = root / 'cited_sources' / label / rel
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              if not dst.exists():
+                  shutil.copy2(src, dst)
+                  copied.append(str(dst))
+          (root / 'cited_sources.txt').write_text('\n'.join(copied) + '\n')
+          print(f'Copied {len(copied)} cited source files')
+          PY
+
+          # Keep logs, reports, exact cited files, and hashes. Drop bulky decompilation trees and APK bytes.
+          rm -rf results/old_2.094/jadx results/current_latest/jadx
+          rm -rf results/old_2.094/extracted results/current_latest/extracted
+          rm -f results/old_2.094/dex_strings.txt results/current_latest/dex_strings.txt
+          rm -rf downloads tools/jadx tools/jadx.zip tools/apkeep
+
+      - name: Upload reproducibility evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: callapp-privacy-reproduction
+          path: |
+            results
+            logs
+            apkeep-version.txt
+            jadx-version.txt
+            callapp_privacy_audit.py
+          if-no-files-found: error
+          retention-days: 30

@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p tools
+          mkdir -p tools logs downloads/old downloads/current
           curl -L --fail --retry 4 \
             -o tools/apkeep \
             https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
@@ -41,73 +41,146 @@ jobs:
           unzip -q tools/jadx.zip -d tools/jadx
           tools/jadx/bin/jadx --version | tee jadx-version.txt
 
-      - name: List CallApp versions
+      - name: Inspect APKPure version API
         shell: bash
         run: |
           set -o pipefail
-          mkdir -p logs downloads/old downloads/current
           tools/apkeep -l -a com.callapp.contacts -d apk-pure 2>&1 | tee logs/available-versions.txt
-
-      - name: Download known-positive and current samples
-        shell: bash
-        run: |
-          set -euxo pipefail
-          tools/apkeep -a com.callapp.contacts@2.094 -d apk-pure downloads/old 2>&1 | tee logs/download-old.txt
-          tools/apkeep -a com.callapp.contacts -d apk-pure downloads/current 2>&1 | tee logs/download-current.txt
-          find downloads -type f -maxdepth 3 -printf '%p %s bytes\n' | sort | tee logs/downloaded-files.txt
-          find downloads -type f -exec sha256sum {} + | sort | tee logs/download-sha256.txt
-
-      - name: Identify samples and run JADX audit
-        shell: bash
-        run: |
-          set -euxo pipefail
-          OLD="$(find downloads/old -type f | sort | head -1)"
-          CURRENT="$(find downloads/current -type f | sort | head -1)"
-          test -n "$OLD" && test -n "$CURRENT"
-          printf 'OLD=%s\nCURRENT=%s\n' "$OLD" "$CURRENT" | tee logs/selected-samples.txt
-          python3 callapp_privacy_audit.py \
-            --sample old_2.094="$OLD" \
-            --sample current_latest="$CURRENT" \
-            --jadx tools/jadx/bin/jadx \
-            --timeout 3000 \
-            --output results \
-            2>&1 | tee logs/audit-run.txt
-
-      - name: Preserve only source files cited by the audit
-        shell: bash
-        run: |
-          set -euxo pipefail
           python3 - <<'PY'
-          import json, shutil
+          import json, requests
           from pathlib import Path
-
-          root = Path('results')
-          evidence = json.loads((root / 'evidence.json').read_text())
-          copied = []
-          for row in evidence:
-              if row.get('source') != 'jadx':
-                  continue
-              label = row['sample']
-              rel = Path(row['location'])
-              src = root / label / 'jadx' / rel
-              if not src.is_file():
-                  continue
-              dst = root / 'cited_sources' / label / rel
-              dst.parent.mkdir(parents=True, exist_ok=True)
-              if not dst.exists():
-                  shutil.copy2(src, dst)
-                  copied.append(str(dst))
-          (root / 'cited_sources.txt').write_text('\n'.join(copied) + '\n')
-          print(f'Copied {len(copied)} cited source files')
+          url='https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.callapp.contacts'
+          headers={'x-cv':'3172501','x-sv':'29','x-abis':'arm64-v8a,armeabi-v7a,armeabi,x86,x86_64','x-gp':'1'}
+          r=requests.get(url,headers=headers,timeout=60)
+          Path('logs/apkpure-status.txt').write_text(f'{r.status_code}\n{r.headers}\n')
+          Path('logs/apkpure-versions-response.bin').write_bytes(r.content)
+          try:
+              obj=r.json()
+              Path('logs/apkpure-versions-response.json').write_text(json.dumps(obj,indent=2,ensure_ascii=False))
+          except Exception as e:
+              Path('logs/apkpure-json-error.txt').write_text(repr(e))
+          print('APKPure API',r.status_code,len(r.content),'contains 2.094:',b'2.094' in r.content)
           PY
 
-          # Keep logs, reports, exact cited files, and hashes. Drop bulky decompilation trees and APK bytes.
-          rm -rf results/old_2.094/jadx results/current_latest/jadx
-          rm -rf results/old_2.094/extracted results/current_latest/extracted
-          rm -f results/old_2.094/dex_strings.txt results/current_latest/dex_strings.txt
-          rm -rf downloads tools/jadx tools/jadx.zip tools/apkeep
+      - name: Download current sample
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tools/apkeep -a com.callapp.contacts -d apk-pure downloads/current 2>&1 | tee logs/download-current.txt
+          CURRENT="$(find downloads/current -type f | sort | head -1)"
+          test -n "$CURRENT"
+          find downloads/current -type f -printf '%p %s bytes\n' | sort | tee logs/current-files.txt
+          find downloads/current -type f -exec sha256sum {} + | sort | tee logs/current-sha256.txt
+
+      - name: Try to recover the 2.094 control sample
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          tools/apkeep -a com.callapp.contacts@2.094 -d apk-pure downloads/old 2>&1 | tee logs/download-old-apkeep.txt || true
+
+          python3 - <<'PY'
+          import html, re, time, requests
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          out=Path('downloads/old'); out.mkdir(parents=True,exist_ok=True)
+          logs=Path('logs')
+          pages=[
+            'https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-2-android-apk-download/',
+            'https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/'
+          ]
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept-Language':'en-US,en;q=0.9'})
+          report=[]
+          for i,page in enumerate(pages):
+              try:
+                  r=s.get(page,timeout=60)
+                  logs.joinpath(f'apkmirror-page-{i}.html').write_bytes(r.content)
+                  report.append(f'page {i}: {r.status_code} {len(r.content)} {r.url}')
+                  text=r.text
+                  hrefs=re.findall(r'href=["\']([^"\']*?/download/\?[^"\']+)["\']',text,re.I)
+                  hrefs += re.findall(r'(https?://[^"\']+?/download/\?[^"\']+)',text,re.I)
+                  seen=[]
+                  for raw in hrefs:
+                      url=urljoin(page,html.unescape(raw))
+                      if url in seen: continue
+                      seen.append(url)
+                      time.sleep(16)
+                      rr=s.get(url,headers={'Referer':page},timeout=180,allow_redirects=True)
+                      logs.joinpath(f'apkmirror-download-{i}-{len(seen)}.headers.txt').write_text(str(rr.status_code)+'\n'+str(rr.headers)+'\n'+rr.url+'\n')
+                      report.append(f'candidate {url} -> {rr.status_code} {len(rr.content)} {rr.headers.get("content-type")} {rr.url}')
+                      if rr.content[:4]==b'PK\x03\x04' and len(rr.content)>5_000_000:
+                          p=out/'com.callapp.contacts_2.094_apkmirror.apk'
+                          p.write_bytes(rr.content)
+                          report.append(f'SAVED {p} {len(rr.content)}')
+                          raise SystemExit
+                      logs.joinpath(f'apkmirror-download-{i}-{len(seen)}.html').write_bytes(rr.content[:2_000_000])
+              except SystemExit:
+                  break
+              except Exception as e:
+                  report.append(f'ERROR page {i}: {e!r}')
+          logs.joinpath('apkmirror-attempt.txt').write_text('\n'.join(report)+'\n')
+          print('\n'.join(report))
+          PY
+
+          find downloads/old -type f -printf '%p %s bytes\n' | sort | tee logs/old-files.txt || true
+          find downloads/old -type f -exec sha256sum {} + | sort | tee logs/old-sha256.txt || true
+
+      - name: Run focused JADX audit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OLD="$(find downloads/old -type f -size +5M | sort | head -1 || true)"
+          CURRENT="$(find downloads/current -type f | sort | head -1)"
+          printf 'OLD=%s\nCURRENT=%s\n' "$OLD" "$CURRENT" | tee logs/selected-samples.txt
+          if [ -n "$OLD" ]; then
+            python3 callapp_privacy_audit.py \
+              --sample old_2.094="$OLD" \
+              --sample current_2.280="$CURRENT" \
+              --jadx tools/jadx/bin/jadx \
+              --timeout 3000 \
+              --output results \
+              2>&1 | tee logs/audit-run.txt
+          else
+            python3 callapp_privacy_audit.py \
+              --sample current_2.280="$CURRENT" \
+              --jadx tools/jadx/bin/jadx \
+              --timeout 3000 \
+              --output results \
+              2>&1 | tee logs/audit-run.txt
+          fi
+
+      - name: Preserve cited source files and trim bulky data
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          if [ -f results/evidence.json ]; then
+            python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          root=Path('results')
+          evidence=json.loads((root/'evidence.json').read_text())
+          copied=[]
+          for row in evidence:
+              if row.get('source')!='jadx': continue
+              src=root/row['sample']/'jadx'/Path(row['location'])
+              if not src.is_file(): continue
+              dst=root/'cited_sources'/row['sample']/Path(row['location'])
+              dst.parent.mkdir(parents=True,exist_ok=True)
+              if not dst.exists():
+                  shutil.copy2(src,dst); copied.append(str(dst))
+          (root/'cited_sources.txt').write_text('\n'.join(copied)+'\n')
+          print('Copied',len(copied),'cited files')
+          PY
+          fi
+          find results -type d -name jadx -prune -exec rm -rf {} + 2>/dev/null || true
+          find results -type d -name extracted -prune -exec rm -rf {} + 2>/dev/null || true
+          rm -rf downloads tools
 
       - name: Upload reproducibility evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: callapp-privacy-reproduction

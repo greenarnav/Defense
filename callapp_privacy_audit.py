@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 TEXT_EXTENSIONS = {".java", ".kt", ".xml", ".smali", ".txt", ".json", ".properties"}
 MAX_TEXT_BYTES = 16 * 1024 * 1024
 
@@ -184,8 +184,15 @@ def run_jadx(jadx: str, apk: Path, output: Path, timeout: int) -> tuple[str,str]
         try:
             p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
             logs.append(f"$ {' '.join(cmd)}\n{p.stdout}")
-            if p.returncode==0: return "completed","\n\n".join(logs)
-            if idx<len(cmds)-1: shutil.rmtree(output,ignore_errors=True); output.mkdir(parents=True,exist_ok=True)
+            if p.returncode==0:
+                return "completed","\n\n".join(logs)
+            # JADX often exits nonzero when some classes fail while still producing
+            # a usable decompilation. Accept the partial tree instead of deleting it.
+            generated = any(output.rglob("*.java")) or any(output.rglob("*.kt"))
+            if generated:
+                return "completed_with_errors","\n\n".join(logs)
+            if idx<len(cmds)-1:
+                shutil.rmtree(output,ignore_errors=True); output.mkdir(parents=True,exist_ok=True)
         except subprocess.TimeoutExpired as exc: return "timed_out","\n\n".join(logs+[str(exc)])
         except OSError as exc: return "failed","\n\n".join(logs+[str(exc)])
     return "failed","\n\n".join(logs)
@@ -268,7 +275,7 @@ def analyze(label: str,path: Path,output: Path,jadx: str|None,timeout: int) -> t
     ev,presence=scan_dex(label,strings); js="not_found"
     if jadx:
         jd=so/"jadx"; js,log=run_jadx(jadx,base,jd,timeout); (so/"jadx.log").write_text(log,errors="replace")
-        if js=="completed": ev.extend(scan_decompiled(label,jd))
+        if js in {"completed","completed_with_errors"}: ev.extend(scan_decompiled(label,jd))
         else: warnings.append("JADX "+js)
     else: warnings.append("JADX not found")
     ev=dedupe(ev)

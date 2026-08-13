@@ -1,0 +1,32 @@
+name: Test archived APKMirror token
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/apkmirror-direct-test.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch exact 2.094 download endpoint
+        shell: bash
+        run: |
+          set -x
+          mkdir -p output
+          URL='https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-2-android-apk-download/download/?forcebaseapk=true&key=6f9157a86b7393c3eac29e9cf1b0c4148984b4b8'
+          curl -L --retry 3 --max-time 180 \
+            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36' \
+            -e 'https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-2-android-apk-download/' \
+            -D output/headers.txt -o output/response.bin "$URL" || true
+          file output/response.bin | tee output/file.txt
+          wc -c output/response.bin | tee output/size.txt
+          sha256sum output/response.bin | tee output/sha256.txt
+          head -c 4 output/response.bin | od -An -tx1 | tee output/magic.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apkmirror-direct-test
+          path: output
+          retention-days: 7

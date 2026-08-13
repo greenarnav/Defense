@@ -1,0 +1,86 @@
+name: Inspect PICOSCAN sample APK
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/inspect-picoscan-sample.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download the authors' sample and JADX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p tools sample
+          curl -L --fail --retry 4 \
+            -o sample/yifan.apk \
+            https://raw.githubusercontent.com/1phan/PICOSCAN/main/samples/apks/yifan.apk
+          sha256sum sample/yifan.apk | tee sample/sha256.txt
+          file sample/yifan.apk | tee sample/file.txt
+          curl -L --fail --retry 4 \
+            -o tools/jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q tools/jadx.zip -d tools/jadx
+
+      - name: Identify and audit sample
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 callapp_privacy_audit.py \
+            --sample picoscan_yifan=sample/yifan.apk \
+            --jadx tools/jadx/bin/jadx \
+            --timeout 3000 \
+            --output results \
+            2>&1 | tee sample/audit-run.txt
+          find results/picoscan_yifan/jadx -type f \( -name AndroidManifest.xml -o -name '*.java' \) \
+            -print0 | xargs -0 grep -Il 'com.callapp.contacts\|package="com.callapp.contacts"' \
+            | head -50 | tee sample/callapp-package-hits.txt || true
+          grep -RIl --include='AndroidManifest.xml' 'package=' results/picoscan_yifan/jadx/resources 2>/dev/null \
+            | head -10 | tee sample/manifest-files.txt || true
+          for f in $(cat sample/manifest-files.txt 2>/dev/null); do sed -n '1,80p' "$f"; done > sample/manifest-head.txt || true
+
+      - name: Preserve evidence and trim
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          if [ -f results/evidence.json ]; then
+            python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          root=Path('results')
+          evidence=json.loads((root/'evidence.json').read_text())
+          for row in evidence:
+              if row.get('source')!='jadx': continue
+              src=root/row['sample']/'jadx'/Path(row['location'])
+              if not src.is_file(): continue
+              dst=root/'cited_sources'/row['sample']/Path(row['location'])
+              dst.parent.mkdir(parents=True,exist_ok=True)
+              if not dst.exists(): shutil.copy2(src,dst)
+          PY
+          fi
+          rm -rf results/picoscan_yifan/jadx results/picoscan_yifan/extracted tools sample/yifan.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: picoscan-sample-inspection
+          path: |
+            results
+            sample
+            callapp_privacy_audit.py
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,65 @@
+name: Recover old CallApp control APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/old-callapp-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install alternate APK downloader
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'git+https://github.com/kiber-io/apkd.git'
+          apkd --help | tee apkd-help.txt
+
+      - name: Query and download from APKCombo
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p logs downloads
+          apkd -p com.callapp.contacts -lv -s apkcombo 2>&1 | tee logs/apkcombo-versions.txt || true
+          apkd -p com.callapp.contacts -d -s apkcombo -vc 2094 2>&1 | tee logs/apkcombo-download-2094.txt || true
+          find . -type f \( -iname '*.apk' -o -iname '*.xapk' -o -iname '*.apks' -o -iname '*.apkm' \) -printf '%p %s bytes\n' | sort | tee logs/found-after-apkcombo.txt
+
+      - name: Query and download from APKPure through alternate client
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          apkd -p com.callapp.contacts -lv -s apkpure 2>&1 | tee logs/apkpure-versions.txt || true
+          apkd -p com.callapp.contacts -d -s apkpure -vc 2094 2>&1 | tee logs/apkpure-download-2094.txt || true
+          find . -type f \( -iname '*.apk' -o -iname '*.xapk' -o -iname '*.apks' -o -iname '*.apkm' \) -printf '%p %s bytes\n' | sort | tee logs/found-final.txt
+          find . -type f \( -iname '*.apk' -o -iname '*.xapk' -o -iname '*.apks' -o -iname '*.apkm' \) -exec sha256sum {} + | sort | tee logs/found-sha256.txt || true
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: old-callapp-recovery
+          path: |
+            logs
+            apkd-help.txt
+            *.apk
+            *.xapk
+            *.apks
+            *.apkm
+            downloads
+          if-no-files-found: warn
+          retention-days: 30

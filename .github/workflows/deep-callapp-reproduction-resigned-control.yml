@@ -54,13 +54,13 @@ jobs:
           base64 -d tools/deep_privacy_audit.py.gz.b64 | gzip -dc > tools/deep_privacy_audit.py
           python tools/patch_deep_privacy_audit.py
           python -m py_compile tools/deep_privacy_audit.py
-          curl -L --fail --retry 4 -o tools/apkeep https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
+          curl -L --fail --retry 8 --retry-all-errors -o tools/apkeep https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
           chmod +x tools/apkeep
           tools/apkeep --version | tee logs/apkeep-version.txt
-          curl -L --fail --retry 4 -o tools/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          curl -L --fail --retry 8 --retry-all-errors -o tools/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
           unzip -q tools/jadx.zip -d tools/jadx
           tools/jadx/bin/jadx --version | tee logs/jadx-version.txt
-          curl -L --fail --retry 4 -o tools/Priv_impl.json https://raw.githubusercontent.com/1phan/PICOSCAN/main/data/privacy-apis/Priv_impl.json
+          curl -L --fail --retry 8 --retry-all-errors -o tools/Priv_impl.json https://raw.githubusercontent.com/1phan/PICOSCAN/main/data/privacy-apis/Priv_impl.json
           sha256sum tools/Priv_impl.json | tee logs/pico-metadb-sha256.txt
 
       - name: Recover exact 2.094 code sample and disclose re-signing
@@ -87,7 +87,7 @@ jobs:
             -H 'X-Local-Time: 2026-08-19T01:00:00Z'
             -H 'Accept: application/json'
           )
-          curl -L --fail-with-body --retry 4 "${COMMON[@]}" --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' -o downloads/old/info.json
+          curl -L --fail-with-body --retry 8 --retry-all-errors "${COMMON[@]}" --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' -o downloads/old/info.json
           python3 - <<'PY'
           from pathlib import Path
           import json,urllib.parse
@@ -100,7 +100,7 @@ jobs:
           Path('downloads/old/url.txt').write_text(values[0][1])
           Path('logs/old-source-metadata.json').write_text(json.dumps({'source':'Appteka API','app_id':info.get('app_id') or '955r139916','package':info.get('package'),'version_name':info.get('ver_name'),'version_code':info.get('ver_code'),'sha1':info.get('sha1'),'size':info.get('size')},indent=2)+'\n')
           PY
-          curl -L --fail-with-body --retry 4 -A "$UA" "$(cat downloads/old/url.txt)" -o downloads/old/CallApp-2.094-resigned.apk
+          curl -L --fail-with-body --retry 8 --retry-all-errors -A "$UA" "$(cat downloads/old/url.txt)" -o downloads/old/CallApp-2.094-resigned.apk
           unzip -t downloads/old/CallApp-2.094-resigned.apk > logs/old-unzip-test.txt
           python3 - <<'PY'
           from pathlib import Path
@@ -127,8 +127,12 @@ jobs:
           tools/apkeep -a com.callapp.contacts@2.280 -d apk-pure downloads/current 2>&1 | tee logs/current-download.txt
           FOUND="$(find downloads/current -type f \( -name '*.xapk' -o -name '*.apk' \) | head -1)"
           test -n "$FOUND"
-          cp "$FOUND" downloads/current/CallApp-2.280.xapk
-          test "$(sha256sum downloads/current/CallApp-2.280.xapk | awk '{print $1}')" = "$CURRENT_XAPK_SHA256"
+          TARGET='downloads/current/CallApp-2.280.xapk'
+          if [ "$(readlink -f "$FOUND")" != "$(readlink -f "$TARGET")" ]; then
+            cp "$FOUND" "$TARGET"
+          fi
+          test -f "$TARGET"
+          test "$(sha256sum "$TARGET" | awk '{print $1}')" = "$CURRENT_XAPK_SHA256"
           python3 - <<'PY'
           from pathlib import Path
           import shutil,zipfile

@@ -1,0 +1,116 @@
+name: Query Appteka CallApp history
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/query-appteka-callapp.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query public Appteka API
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out analysis
+          UA='Appteka/22.1 (Android 14; research-reproduction)'
+          BASE='https://appteka.store/api/1/app/info'
+          COMMON=(
+            -H "User-Agent: $UA"
+            -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
+            -H 'X-App-Package: com.tomclaw.appsend'
+            -H 'X-App-Version-Name: 22.1'
+            -H 'X-App-Version-Code: 1095'
+            -H 'X-App-Signature: research'
+            -H 'X-Android-Version: 34'
+            -H 'X-Android-Release: 14'
+            -H 'X-Device-Manufacturer: Google'
+            -H 'X-Device-Model: Pixel 6'
+            -H 'X-Locale: en-US'
+            -H 'X-Theme: light'
+            -H 'X-Timezone: UTC'
+            -H 'X-Local-Time: 2026-08-19T01:00:00Z'
+            -H 'Accept: application/json'
+          )
+          curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
+            --get "$BASE" \
+            --data-urlencode 'package=com.callapp.contacts' \
+            --data-urlencode 'locale=en' \
+            -D out/by-package-headers.txt \
+            -o out/by-package.json || true
+          curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
+            --get "$BASE" \
+            --data-urlencode 'app_id=1dcr163760' \
+            --data-urlencode 'locale=en' \
+            -D out/by-id-headers.txt \
+            -o out/by-id.json || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+
+          def load(path):
+              p=Path(path)
+              if not p.exists(): return None, 'missing'
+              raw=p.read_text('utf-8', errors='replace')
+              try: return json.loads(raw), 'json'
+              except Exception: return raw, 'text'
+
+          reports=[]
+          full=None
+          for name in ('by-package','by-id'):
+              obj,kind=load(f'out/{name}.json')
+              entry={'request':name,'kind':kind}
+              if kind=='json':
+                  entry['top_keys']=list(obj) if isinstance(obj,dict) else []
+                  entry['status']=obj.get('status') if isinstance(obj,dict) else None
+                  entry['description']=obj.get('description') if isinstance(obj,dict) else None
+                  result=obj.get('result') if isinstance(obj,dict) else None
+                  if isinstance(result,dict):
+                      versions=result.get('versions') or []
+                      entry['version_count']=len(versions) if isinstance(versions,list) else None
+                      entry['current_app_id']=(result.get('info') or {}).get('app_id') if isinstance(result.get('info'),dict) else None
+                      if isinstance(versions,list):
+                          matches=[]
+                          for v in versions:
+                              if not isinstance(v,dict): continue
+                              blob=json.dumps(v,ensure_ascii=False)
+                              if re.search(r'(?<!\d)2\.094(?!\d)|(?<!\d)2094(?!\d)',blob):
+                                  matches.append(v)
+                          entry['target_matches']=matches
+                      if full is None and result: full=obj
+              else:
+                  entry['preview']=str(obj)[:1000]
+              reports.append(entry)
+          Path('analysis/appteka-query-summary.json').write_text(json.dumps(reports,indent=2,ensure_ascii=False)+'\n')
+          if full is not None:
+              Path('out/callapp-info.json').write_text(json.dumps(full,indent=2,ensure_ascii=False)+'\n')
+          print(json.dumps(reports,indent=2,ensure_ascii=False))
+          PY
+
+      - name: Upload API evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: appteka-callapp-api
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish sanitized summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/appteka-query-summary.json
+          git commit -m 'Record Appteka CallApp history query' || exit 0
+          git push

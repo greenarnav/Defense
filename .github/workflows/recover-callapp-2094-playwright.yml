@@ -1,0 +1,137 @@
+name: Browser recovery of CallApp 2.094 APKMirror bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-playwright.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish workflow run id
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p analysis
+          printf 'run_id=%s\nrun_attempt=%s\ncommit=%s\n' '${{ github.run_id }}' '${{ github.run_attempt }}' '${{ github.sha }}' > analysis/playwright-recovery-run-id.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/playwright-recovery-run-id.txt
+          git commit -m 'Record browser recovery workflow run id'
+          git push
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Playwright Chromium
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Open APKMirror and capture official bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          cat > out/recover.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+
+          const releaseUrl = 'https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/';
+          const expected = 'c7d4abf65d93f3a208f60ba82d61889eaecff70ccffa8ed072947d0944d48711';
+          const log = [];
+          const browser = await chromium.launch({headless: true, args: ['--disable-blink-features=AutomationControlled']});
+          const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            locale: 'en-US',
+            viewport: {width: 1440, height: 1000},
+            extraHTTPHeaders: {'Accept-Language': 'en-US,en;q=0.9'}
+          });
+          const page = await context.newPage();
+          page.on('console', m => log.push('console: '+m.text()));
+          page.on('response', r => {
+            const u=r.url().toLowerCase();
+            if (u.includes('apkmirror') || u.includes('downloadr')) log.push(`response ${r.status()} ${r.url()}`);
+          });
+          try {
+            await page.goto(releaseUrl, {waitUntil: 'domcontentloaded', timeout: 120000});
+            await page.waitForTimeout(20000);
+            await page.screenshot({path:'out/release.png', fullPage:true});
+            fs.writeFileSync('out/release.html', await page.content());
+            log.push('release title: '+await page.title());
+            const anchors = await page.locator('a').evaluateAll(as => as.map(a => ({text:(a.textContent||'').trim(), href:a.href})).filter(x=>x.href));
+            fs.writeFileSync('out/release-anchors.json', JSON.stringify(anchors,null,2));
+            let downloadPage = anchors.find(x => x.href.includes('/download/?key='));
+            if (!downloadPage) {
+              const candidates = page.getByRole('link', {name:/download apk bundle|download/i});
+              const count = await candidates.count();
+              log.push('download-like links: '+count);
+              for (let i=0;i<count;i++) {
+                const href=await candidates.nth(i).getAttribute('href');
+                if (href && href.includes('/download/')) { downloadPage={href:new URL(href,releaseUrl).href,text:'locator'}; break; }
+              }
+            }
+            if (!downloadPage) throw new Error('No generated download page URL in browser DOM');
+            log.push('download page: '+downloadPage.href);
+            await page.goto(downloadPage.href, {waitUntil:'domcontentloaded', timeout:120000});
+            await page.waitForTimeout(22000);
+            await page.screenshot({path:'out/download-page.png', fullPage:true});
+            fs.writeFileSync('out/download-page.html', await page.content());
+            const anchors2 = await page.locator('a').evaluateAll(as => as.map(a => ({text:(a.textContent||'').trim(), href:a.href})).filter(x=>x.href));
+            fs.writeFileSync('out/download-anchors.json', JSON.stringify(anchors2,null,2));
+            let direct = anchors2.find(x => /downloadr\d*\.apkmirror\.com|forcebaseapk|\.apkm(?:\?|$)|\.apk(?:\?|$)/i.test(x.href));
+            if (!direct) direct = anchors2.find(x => /download/i.test(x.text) && !x.href.includes('/download/?key='));
+            if (!direct) throw new Error('No direct binary link found on download page');
+            log.push('direct candidate: '+direct.href);
+            const response = await context.request.get(direct.href, {headers:{Referer:page.url()}, timeout:120000, failOnStatusCode:false});
+            log.push(`direct response ${response.status()} ${response.headers()['content-type']||''}`);
+            const body = await response.body();
+            fs.writeFileSync('out/candidate.bin', body);
+            const sha = crypto.createHash('sha256').update(body).digest('hex');
+            log.push(`candidate bytes=${body.length} sha256=${sha}`);
+            fs.writeFileSync('out/verification.json', JSON.stringify({url:direct.href,status:response.status(),contentType:response.headers()['content-type'],size:body.length,sha256:sha,exactBundleHashMatch:sha===expected},null,2));
+            if (sha===expected) {
+              fs.renameSync('out/candidate.bin','out/CallApp-2.094-official.apkm');
+              fs.writeFileSync('out/VERIFIED','exact bundle SHA-256 matched\n');
+            }
+          } catch (e) {
+            log.push('ERROR: '+(e?.stack||e));
+            try { await page.screenshot({path:'out/error.png', fullPage:true}); } catch {}
+            process.exitCode=1;
+          } finally {
+            fs.writeFileSync('out/browser.log', log.join('\n')+'\n');
+            await browser.close();
+          }
+          JS
+          node out/recover.mjs
+
+      - name: Verify archive structure
+        if: ${{ hashFiles('out/VERIFIED') != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          unzip -t out/CallApp-2.094-official.apkm > out/unzip-test.txt
+          sha256sum out/CallApp-2.094-official.apkm > out/sha256.txt
+
+      - name: Upload browser recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-callapp-2094-recovery
+          path: out
+          if-no-files-found: error
+          retention-days: 7

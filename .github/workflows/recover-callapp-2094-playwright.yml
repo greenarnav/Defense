@@ -54,6 +54,7 @@ jobs:
           const releaseUrl = 'https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/';
           const expected = 'c7d4abf65d93f3a208f60ba82d61889eaecff70ccffa8ed072947d0944d48711';
           const log = [];
+          const sha256 = b => crypto.createHash('sha256').update(b).digest('hex');
           const browser = await chromium.launch({headless: true, args: ['--disable-blink-features=AutomationControlled']});
           const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
@@ -69,7 +70,7 @@ jobs:
           });
           try {
             await page.goto(releaseUrl, {waitUntil: 'domcontentloaded', timeout: 120000});
-            await page.waitForTimeout(20000);
+            await page.waitForTimeout(8000);
             await page.screenshot({path:'out/release.png', fullPage:true});
             fs.writeFileSync('out/release.html', await page.content());
             log.push('release title: '+await page.title());
@@ -78,9 +79,7 @@ jobs:
             let downloadPage = anchors.find(x => x.href.includes('/download/?key='));
             if (!downloadPage) {
               const candidates = page.getByRole('link', {name:/download apk bundle|download/i});
-              const count = await candidates.count();
-              log.push('download-like links: '+count);
-              for (let i=0;i<count;i++) {
+              for (let i=0;i<await candidates.count();i++) {
                 const href=await candidates.nth(i).getAttribute('href');
                 if (href && href.includes('/download/')) { downloadPage={href:new URL(href,releaseUrl).href,text:'locator'}; break; }
               }
@@ -88,26 +87,49 @@ jobs:
             if (!downloadPage) throw new Error('No generated download page URL in browser DOM');
             log.push('download page: '+downloadPage.href);
             await page.goto(downloadPage.href, {waitUntil:'domcontentloaded', timeout:120000});
-            await page.waitForTimeout(22000);
+            await page.waitForTimeout(8000);
             await page.screenshot({path:'out/download-page.png', fullPage:true});
             fs.writeFileSync('out/download-page.html', await page.content());
-            const anchors2 = await page.locator('a').evaluateAll(as => as.map(a => ({text:(a.textContent||'').trim(), href:a.href})).filter(x=>x.href));
+            const anchors2 = await page.locator('a').evaluateAll(as => as.map(a => ({text:(a.textContent||'').trim(), href:a.href, id:a.id})).filter(x=>x.href));
             fs.writeFileSync('out/download-anchors.json', JSON.stringify(anchors2,null,2));
-            let direct = anchors2.find(x => /downloadr\d*\.apkmirror\.com|forcebaseapk|\.apkm(?:\?|$)|\.apk(?:\?|$)/i.test(x.href));
-            if (!direct) direct = anchors2.find(x => /download/i.test(x.text) && !x.href.includes('/download/?key='));
-            if (!direct) throw new Error('No direct binary link found on download page');
+
+            let direct = anchors2.find(x => x.id === 'download-link');
+            if (!direct) direct = anchors2.find(x => /\/wp-content\/themes\/APKMirror\/download\.php\?/i.test(x.href));
+            if (!direct) direct = anchors2.find(x => /downloadr\d*\.apkmirror\.com|forcebaseapk|\.apkm(?:\?|$)|\.apk(?:\?|$)/i.test(x.href));
+            if (!direct) throw new Error('No direct APKMirror download.php/binary link found on download page');
             log.push('direct candidate: '+direct.href);
+
+            let body = null;
+            let meta = {url:direct.href};
             const response = await context.request.get(direct.href, {headers:{Referer:page.url()}, timeout:120000, failOnStatusCode:false});
-            log.push(`direct response ${response.status()} ${response.headers()['content-type']||''}`);
-            const body = await response.body();
-            fs.writeFileSync('out/candidate.bin', body);
-            const sha = crypto.createHash('sha256').update(body).digest('hex');
-            log.push(`candidate bytes=${body.length} sha256=${sha}`);
-            fs.writeFileSync('out/verification.json', JSON.stringify({url:direct.href,status:response.status(),contentType:response.headers()['content-type'],size:body.length,sha256:sha,exactBundleHashMatch:sha===expected},null,2));
-            if (sha===expected) {
-              fs.renameSync('out/candidate.bin','out/CallApp-2.094-official.apkm');
-              fs.writeFileSync('out/VERIFIED','exact bundle SHA-256 matched\n');
+            meta.requestStatus = response.status();
+            meta.requestHeaders = response.headers();
+            body = await response.body();
+            log.push(`direct request ${response.status()} ${response.headers()['content-type']||''} bytes=${body.length} sha256=${sha256(body)}`);
+
+            if (sha256(body) !== expected) {
+              log.push('request body was not expected bundle; trying browser download event');
+              const href = await page.locator('#download-link').getAttribute('href');
+              if (!href) throw new Error('download-link disappeared before click fallback');
+              const downloadPromise = page.waitForEvent('download', {timeout:120000});
+              await page.locator('#download-link').click();
+              const download = await downloadPromise;
+              const tempPath = await download.path();
+              if (!tempPath) throw new Error('browser download produced no local path');
+              body = fs.readFileSync(tempPath);
+              meta.browserSuggestedFilename = download.suggestedFilename();
+              log.push(`browser download bytes=${body.length} sha256=${sha256(body)} filename=${download.suggestedFilename()}`);
             }
+
+            fs.writeFileSync('out/candidate.bin', body);
+            const sha = sha256(body);
+            meta.size = body.length;
+            meta.sha256 = sha;
+            meta.exactBundleHashMatch = sha===expected;
+            fs.writeFileSync('out/verification.json', JSON.stringify(meta,null,2));
+            if (sha !== expected) throw new Error(`Downloaded file hash ${sha} did not match official bundle hash ${expected}`);
+            fs.renameSync('out/candidate.bin','out/CallApp-2.094-official.apkm');
+            fs.writeFileSync('out/VERIFIED','exact APKMirror bundle SHA-256 matched\n');
           } catch (e) {
             log.push('ERROR: '+(e?.stack||e));
             try { await page.screenshot({path:'out/error.png', fullPage:true}); } catch {}

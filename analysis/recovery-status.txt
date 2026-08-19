@@ -1,0 +1,9 @@
+checked_at_utc=2026-08-19T01:10:48Z
+source=https://apk.cafe/download?file_id=2620707%2Fcaller-id-and-block
+curl_exit=0
+size_bytes=174228
+file_type=HTML document, Unicode text, UTF-8 text, with very long lines (63259)
+zip_valid=no
+expected_sha256=047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525
+actual_sha256=13eed7f71a3f780b7cf1132d7adbfba638906e1d290f631e573b49efe3f7e2ad
+verified=no

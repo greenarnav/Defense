@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and verify archived APK
+      - name: Download and inspect archived APK response
         shell: bash
         run: |
           set +e
@@ -25,7 +25,9 @@ jobs:
           URL='https://apk.cafe/download?file_id=2620707%2Fcaller-id-and-block'
           EXPECTED='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
           curl -L --fail --retry 5 --retry-all-errors \
+            -c out/cookies.txt -b out/cookies.txt \
             -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36' \
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
             -H 'Referer: https://caller-id-and-block.apk.cafe/' \
             "$URL" -o out/callapp-2.094.apk >out/curl-stdout.txt 2>out/curl-stderr.txt
           CURL_RC=$?
@@ -57,6 +59,36 @@ jobs:
             echo "verified=$VERIFIED"
           } | tee analysis/recovery-status.txt
 
+          python3 - <<'PY'
+          from pathlib import Path
+          import html, re
+          p = Path('out/callapp-2.094.apk')
+          text = p.read_text('utf-8', errors='replace') if p.exists() else ''
+          decoded = html.unescape(text)
+          urls = []
+          for pattern in [
+              r'https?://[^\s"\'<>]+',
+              r'(?:href|src|data-url|data-href|action)=["\']([^"\']+)',
+          ]:
+              for match in re.finditer(pattern, decoded, re.I):
+                  value = match.group(1) if match.lastindex else match.group(0)
+                  if any(k in value.lower() for k in ('apk', 'download', 'file_id', '2620707', 'cdn', 'storage')):
+                      urls.append(value)
+          snippets=[]
+          for needle in ('2620707','file_id','download','\.apk','captcha','cloudflare'):
+              for m in list(re.finditer(needle, decoded, re.I))[:20]:
+                  snippets.append(decoded[max(0,m.start()-220):min(len(decoded),m.end()+420)].replace('\n',' '))
+          unique=[]
+          seen=set()
+          for v in urls:
+              v=v.strip()
+              if v not in seen:
+                  seen.add(v); unique.append(v)
+          Path('analysis/apkcafe-links.txt').write_text('\n'.join(unique[:300])+'\n', encoding='utf-8')
+          Path('analysis/apkcafe-snippets.txt').write_text('\n---\n'.join(snippets[:100])+'\n', encoding='utf-8')
+          print('candidate_urls',len(unique),'snippets',len(snippets))
+          PY
+
       - name: Upload verified APK privately as workflow artifact
         if: ${{ hashFiles('out/VERIFIED') != '' }}
         uses: actions/upload-artifact@v4
@@ -72,6 +104,6 @@ jobs:
           set -euxo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add analysis/recovery-status.txt
-          git commit -m 'Record CallApp 2.094 recovery status' || exit 0
+          git add analysis/recovery-status.txt analysis/apkcafe-links.txt analysis/apkcafe-snippets.txt
+          git commit -m 'Inspect CallApp 2.094 archive response' || exit 0
           git push

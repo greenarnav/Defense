@@ -1,0 +1,199 @@
+name: Full CallApp reproduction with disclosed re-signed control
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deep-callapp-reproduction-resigned-control.yml'
+      - 'tools/deep_privacy_audit.py.gz.b64'
+      - 'tools/patch_deep_privacy_audit.py'
+
+permissions:
+  contents: write
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    env:
+      OFFICIAL_OLD_CERT_SHA256: 5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5
+      CURRENT_XAPK_SHA256: 5efbc286c10d387d2d179a87a08ed1dbaff8598daeaeaa7857ff8d39da8d7da9
+      CURRENT_BASE_SHA256: 2c17e9da2ecf62e036841c17f0e6c28586ac6983419cf08d2b43a26a5a5fa316
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish workflow run id
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p analysis
+          printf 'run_id=%s\nrun_attempt=%s\ncommit=%s\n' '${{ github.run_id }}' '${{ github.run_attempt }}' '${{ github.sha }}' > analysis/deep-resigned-run-id.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/deep-resigned-run-id.txt
+          git commit -m 'Record deep CallApp reproduction run id'
+          git push
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+          mkdir -p tools downloads/old downloads/current logs work results
+          base64 -d tools/deep_privacy_audit.py.gz.b64 | gzip -dc > tools/deep_privacy_audit.py
+          python tools/patch_deep_privacy_audit.py
+          python -m py_compile tools/deep_privacy_audit.py
+          curl -L --fail --retry 4 -o tools/apkeep https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
+          chmod +x tools/apkeep
+          tools/apkeep --version | tee logs/apkeep-version.txt
+          curl -L --fail --retry 4 -o tools/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q tools/jadx.zip -d tools/jadx
+          tools/jadx/bin/jadx --version | tee logs/jadx-version.txt
+          curl -L --fail --retry 4 -o tools/Priv_impl.json https://raw.githubusercontent.com/1phan/PICOSCAN/main/data/privacy-apis/Priv_impl.json
+          sha256sum tools/Priv_impl.json | tee logs/pico-metadb-sha256.txt
+
+      - name: Recover exact 2.094 code sample and disclose re-signing
+        shell: bash
+        run: |
+          set -euxo pipefail
+          UA='Appteka/22.1 (Android 14; research-reproduction)'
+          BASE='https://appteka.store/api/1/app/info'
+          APP_ID='955r139916'
+          COMMON=(
+            -H "User-Agent: $UA"
+            -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
+            -H 'X-App-Package: com.tomclaw.appsend'
+            -H 'X-App-Version-Name: 22.1'
+            -H 'X-App-Version-Code: 1095'
+            -H 'X-App-Signature: research'
+            -H 'X-Android-Version: 34'
+            -H 'X-Android-Release: 14'
+            -H 'X-Device-Manufacturer: Google'
+            -H 'X-Device-Model: Pixel 6'
+            -H 'X-Locale: en-US'
+            -H 'X-Theme: light'
+            -H 'X-Timezone: UTC'
+            -H 'X-Local-Time: 2026-08-19T01:00:00Z'
+            -H 'Accept: application/json'
+          )
+          curl -L --fail-with-body --retry 4 "${COMMON[@]}" --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' -o downloads/old/info.json
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,urllib.parse
+          obj=json.loads(Path('downloads/old/info.json').read_text()); r=obj.get('result') or {}; info=r.get('info') or {}
+          values=[]
+          for k in ('link','url','download_url','file_url'):
+              v=r.get(k)
+              if isinstance(v,str) and v.strip(): values.append((k,urllib.parse.urljoin('https://appteka.store/',v)))
+          if not values: raise SystemExit('No 2.094 download URL')
+          Path('downloads/old/url.txt').write_text(values[0][1])
+          Path('logs/old-source-metadata.json').write_text(json.dumps({'source':'Appteka API','app_id':info.get('app_id') or '955r139916','package':info.get('package'),'version_name':info.get('ver_name'),'version_code':info.get('ver_code'),'sha1':info.get('sha1'),'size':info.get('size')},indent=2)+'\n')
+          PY
+          curl -L --fail-with-body --retry 4 -A "$UA" "$(cat downloads/old/url.txt)" -o downloads/old/CallApp-2.094-resigned.apk
+          unzip -t downloads/old/CallApp-2.094-resigned.apk > logs/old-unzip-test.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          from androguard.core.apk import APK
+          import hashlib,json,os
+          p=Path('downloads/old/CallApp-2.094-resigned.apk'); apk=APK(str(p)); blobs=[]
+          for n in ('get_certificates_der_v3','get_certificates_der_v2','get_certificates_der_v1'):
+              fn=getattr(apk,n,None)
+              if fn:
+                  try: blobs.extend(list(fn() or []))
+                  except Exception: pass
+          certs=sorted({hashlib.sha256(bytes(x)).hexdigest() for x in blobs})
+          identity=apk.get_package()=='com.callapp.contacts' and str(apk.get_androidversion_name())=='2.094' and str(apk.get_androidversion_code())=='2094'
+          result={'package':apk.get_package(),'version_name':apk.get_androidversion_name(),'version_code':apk.get_androidversion_code(),'apk_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'certificate_sha256':certs,'official_certificate_sha256':os.environ['OFFICIAL_OLD_CERT_SHA256'],'identity_match':identity,'official_signature_match':os.environ['OFFICIAL_OLD_CERT_SHA256'] in certs,'control_status':'exact package/version; distributor re-signed; use only as code-level positive control'}
+          Path('logs/old-control-authentication.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          if not identity: raise SystemExit('Wrong old package/version')
+          PY
+
+      - name: Download and authenticate current 2.280 sample
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tools/apkeep -a com.callapp.contacts@2.280 -d apk-pure downloads/current 2>&1 | tee logs/current-download.txt
+          FOUND="$(find downloads/current -type f \( -name '*.xapk' -o -name '*.apk' \) | head -1)"
+          test -n "$FOUND"
+          cp "$FOUND" downloads/current/CallApp-2.280.xapk
+          test "$(sha256sum downloads/current/CallApp-2.280.xapk | awk '{print $1}')" = "$CURRENT_XAPK_SHA256"
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil,zipfile
+          bundle=Path('downloads/current/CallApp-2.280.xapk')
+          if bundle.suffix.lower()=='.apk': shutil.copy2(bundle,'downloads/current/CallApp-2.280-base.apk')
+          else:
+              with zipfile.ZipFile(bundle) as z:
+                  apks=[i for i in z.infolist() if not i.is_dir() and i.filename.lower().endswith('.apk')]
+                  def score(i):
+                      b=Path(i.filename.lower()).name; s=i.file_size/1e6
+                      if b=='base.apk': s+=2000
+                      if b=='com.callapp.contacts.apk': s+=1900
+                      if 'base-master' in b: s+=1700
+                      if b.startswith('base-'): s+=1400
+                      if any(x in b for x in ('config.','config_','split_config','dpi','arm64','armeabi','x86')): s-=1800
+                      return s
+                  chosen=max(apks,key=score)
+                  with z.open(chosen) as src,open('downloads/current/CallApp-2.280-base.apk','wb') as dst: shutil.copyfileobj(src,dst)
+                  Path('logs/current-selected-base.txt').write_text(chosen.filename+'\n')
+          PY
+          unzip -t downloads/current/CallApp-2.280-base.apk > logs/current-unzip-test.txt
+          test "$(sha256sum downloads/current/CallApp-2.280-base.apk | awk '{print $1}')" = "$CURRENT_BASE_SHA256"
+          sha256sum downloads/current/CallApp-2.280.xapk downloads/current/CallApp-2.280-base.apk | tee logs/current-sha256.txt
+
+      - name: Decompile both APKs using JADX
+        shell: bash
+        run: |
+          set +e
+          mkdir -p work/old work/current
+          tools/jadx/bin/jadx --deobf --show-bad-code --threads-count 4 -d work/old downloads/old/CallApp-2.094-resigned.apk > logs/jadx-old.txt 2>&1
+          OLD_RC=$?
+          tools/jadx/bin/jadx --deobf --show-bad-code --threads-count 4 -d work/current downloads/current/CallApp-2.280-base.apk > logs/jadx-current.txt 2>&1
+          CURRENT_RC=$?
+          set -e
+          printf 'old_rc=%s\ncurrent_rc=%s\n' "$OLD_RC" "$CURRENT_RC" | tee logs/jadx-return-codes.txt
+          OLD_COUNT="$(find work/old/sources -name '*.java' | wc -l)"; CURRENT_COUNT="$(find work/current/sources -name '*.java' | wc -l)"
+          printf 'old_java=%s\ncurrent_java=%s\n' "$OLD_COUNT" "$CURRENT_COUNT" | tee logs/jadx-source-counts.txt
+          test "$OLD_COUNT" -gt 100
+          test "$CURRENT_COUNT" -gt 100
+
+      - name: Run DEX xref and source audit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > config.json <<'JSON'
+          {
+            "samples": [
+              {"label":"old_2.094_resigned_control","apk":"downloads/old/CallApp-2.094-resigned.apk","source_root":"work/old/sources"},
+              {"label":"current_2.280","apk":"downloads/current/CallApp-2.280-base.apk","source_root":"work/current/sources"}
+            ]
+          }
+          JSON
+          python tools/deep_privacy_audit.py --config config.json --pico-meta tools/Priv_impl.json --output results 2>&1 | tee logs/deep-audit.txt
+          find results logs -type f -exec sha256sum {} + | sort > results/artifact-sha256.txt
+
+      - name: Upload complete proof bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-resigned-control-vs-2.280-full-reproduction
+          path: |
+            results
+            logs
+            tools/deep_privacy_audit.py
+            tools/Priv_impl.json
+            config.json
+          if-no-files-found: warn
+          retention-days: 14

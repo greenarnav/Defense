@@ -1,0 +1,108 @@
+name: Observable APKMirror CallApp 2.094 recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-apkmirror-observable.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish workflow run id
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p analysis
+          printf 'run_id=%s\nrun_attempt=%s\ncommit=%s\n' '${{ github.run_id }}' '${{ github.run_attempt }}' '${{ github.sha }}' > analysis/apkmirror-observable-run-id.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/apkmirror-observable-run-id.txt
+          git commit -m 'Record APKMirror recovery workflow run id'
+          git push
+
+      - name: Fetch release and resolve generated download URL
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          PAGE='https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          curl -L --fail-with-body --retry 4 -A "$UA" -c out/cookies.txt -b out/cookies.txt "$PAGE" -o out/release.html
+          python3 - <<'PY'
+          from pathlib import Path
+          import html,re,urllib.parse
+          text=html.unescape(Path('out/release.html').read_text('utf-8',errors='replace')).replace('\\/','/')
+          links=[]
+          for m in re.finditer(r'href=["\']([^"\']+)',text,re.I):
+              u=urllib.parse.urljoin('https://www.apkmirror.com/',m.group(1))
+              if '/download/?key=' in u: links.append(u)
+          if not links: raise SystemExit('No generated /download/?key= URL found')
+          Path('out/generated-download-url.txt').write_text(links[0])
+          print(links[0])
+          PY
+          curl -L --fail-with-body --retry 4 -A "$UA" -e "$PAGE" -c out/cookies.txt -b out/cookies.txt \
+            "$(cat out/generated-download-url.txt)" -o out/download.html
+
+      - name: Resolve and download bundle candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import html,json,re,urllib.parse
+          text=html.unescape(Path('out/download.html').read_text('utf-8',errors='replace')).replace('\\/','/')
+          links=[]
+          for pat in [r'https?://[^\s"\'<>]+',r'(?:href|src|data-url|data-href|action)=["\']([^"\']+)']:
+              for m in re.finditer(pat,text,re.I):
+                  u=m.group(1) if m.lastindex else m.group(0)
+                  u=urllib.parse.urljoin('https://www.apkmirror.com/',u).rstrip('),;')
+                  low=u.lower()
+                  if any(x in low for x in ('downloadr','forcebaseapk','.apkm','.apk','download.php')):
+                      links.append(u)
+          unique=[]; seen=set()
+          for u in links:
+              if u not in seen: seen.add(u); unique.append(u)
+          Path('out/direct-candidates.json').write_text(json.dumps(unique,indent=2)+'\n')
+          print(json.dumps(unique,indent=2))
+          if not unique: raise SystemExit('No direct candidate found in download page')
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,subprocess,zipfile
+          urls=json.loads(Path('out/direct-candidates.json').read_text())
+          results=[]; accepted=None
+          for i,u in enumerate(urls[:60]):
+              p=Path(f'out/candidate-{i:03d}.bin')
+              rc=subprocess.call(['curl','-L','--fail-with-body','--retry','3','-A','Mozilla/5.0','-e','https://www.apkmirror.com/',u,'-o',str(p)])
+              size=p.stat().st_size if p.exists() else 0
+              sha=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+              iszip=zipfile.is_zipfile(p) if p.exists() else False
+              exact=sha=='c7d4abf65d93f3a208f60ba82d61889eaecff70ccffa8ed072947d0944d48711'
+              results.append({'url':u,'curl_exit':rc,'size_bytes':size,'sha256':sha,'zip':iszip,'exact_bundle_hash_match':exact})
+              if iszip and exact:
+                  accepted=p; break
+              if p.exists() and not iszip: p.unlink()
+          Path('out/probes.json').write_text(json.dumps(results,indent=2)+'\n')
+          print(json.dumps(results,indent=2))
+          if accepted:
+              accepted.replace('out/CallApp-2.094-official.apkm')
+              Path('out/VERIFIED').write_text('bundle hash matched\n')
+          PY
+
+      - name: Upload all recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: observable-apkmirror-callapp-2094
+          path: out
+          if-no-files-found: error
+          retention-days: 7

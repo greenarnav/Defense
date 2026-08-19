@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
+# The patch is deterministic; this revision also retriggers the evidence workflow
+# after a transient GitHub release-asset connection reset.
 path = Path('tools/deep_privacy_audit.py')
 text = path.read_text(encoding='utf-8')
 replacements = {

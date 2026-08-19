@@ -8,7 +8,7 @@ on:
       - '.github/workflows/recover-callapp-2094-apkcafe.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   recover:
@@ -17,28 +17,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download archived APK
+      - name: Download and verify archived APK
         shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p out
+          set +e
+          mkdir -p out analysis
           URL='https://apk.cafe/download?file_id=2620707%2Fcaller-id-and-block'
+          EXPECTED='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
           curl -L --fail --retry 5 --retry-all-errors \
             -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36' \
             -H 'Referer: https://caller-id-and-block.apk.cafe/' \
-            "$URL" -o out/callapp-2.094.apk
-          file out/callapp-2.094.apk | tee out/file.txt
-          stat -c '%n %s bytes' out/callapp-2.094.apk | tee out/size.txt
-          sha256sum out/callapp-2.094.apk | tee out/sha256.txt
-          unzip -t out/callapp-2.094.apk > out/unzip-test.txt
-          EXPECTED='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
-          ACTUAL="$(sha256sum out/callapp-2.094.apk | awk '{print $1}')"
-          test "$ACTUAL" = "$EXPECTED"
+            "$URL" -o out/callapp-2.094.apk >out/curl-stdout.txt 2>out/curl-stderr.txt
+          CURL_RC=$?
+          ACTUAL='missing'
+          SIZE=0
+          FILE_TYPE='missing'
+          ZIP_OK='no'
+          VERIFIED='no'
+          if [ -f out/callapp-2.094.apk ]; then
+            ACTUAL="$(sha256sum out/callapp-2.094.apk | awk '{print $1}')"
+            SIZE="$(stat -c '%s' out/callapp-2.094.apk)"
+            FILE_TYPE="$(file -b out/callapp-2.094.apk)"
+            unzip -t out/callapp-2.094.apk > out/unzip-test.txt 2>&1
+            [ $? -eq 0 ] && ZIP_OK='yes'
+          fi
+          if [ "$CURL_RC" -eq 0 ] && [ "$ACTUAL" = "$EXPECTED" ] && [ "$ZIP_OK" = 'yes' ]; then
+            VERIFIED='yes'
+            touch out/VERIFIED
+          fi
+          {
+            echo "checked_at_utc=$(date -u +%FT%TZ)"
+            echo "source=$URL"
+            echo "curl_exit=$CURL_RC"
+            echo "size_bytes=$SIZE"
+            echo "file_type=$FILE_TYPE"
+            echo "zip_valid=$ZIP_OK"
+            echo "expected_sha256=$EXPECTED"
+            echo "actual_sha256=$ACTUAL"
+            echo "verified=$VERIFIED"
+          } | tee analysis/recovery-status.txt
 
       - name: Upload verified APK privately as workflow artifact
+        if: ${{ hashFiles('out/VERIFIED') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: callapp-2.094-verified
           path: out
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish status to repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/recovery-status.txt
+          git commit -m 'Record CallApp 2.094 recovery status' || exit 0
+          git push

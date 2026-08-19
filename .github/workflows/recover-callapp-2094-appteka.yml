@@ -1,0 +1,153 @@
+name: Recover exact CallApp 2.094 from Appteka
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-appteka.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query target release and download APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out analysis
+          UA='Appteka/22.1 (Android 14; research-reproduction)'
+          BASE='https://appteka.store/api/1/app/info'
+          APP_ID='955r139916'
+          EXPECTED_SHA256='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
+          COMMON=(
+            -H "User-Agent: $UA"
+            -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
+            -H 'X-App-Package: com.tomclaw.appsend'
+            -H 'X-App-Version-Name: 22.1'
+            -H 'X-App-Version-Code: 1095'
+            -H 'X-App-Signature: research'
+            -H 'X-Android-Version: 34'
+            -H 'X-Android-Release: 14'
+            -H 'X-Device-Manufacturer: Google'
+            -H 'X-Device-Model: Pixel 6'
+            -H 'X-Locale: en-US'
+            -H 'X-Theme: light'
+            -H 'X-Timezone: UTC'
+            -H 'X-Local-Time: 2026-08-19T01:00:00Z'
+            -H 'Accept: application/json'
+          )
+          curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
+            --get "$BASE" \
+            --data-urlencode "app_id=$APP_ID" \
+            --data-urlencode 'locale=en' \
+            -D out/info-headers.txt \
+            -o out/info.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, urllib.parse
+          obj=json.loads(Path('out/info.json').read_text())
+          result=obj.get('result') or {}
+          info=result.get('info') or {}
+          candidates=[]
+          for key in ('link','url','download_url','file_url'):
+              value=result.get(key)
+              if isinstance(value,str) and value.startswith(('http://','https://')):
+                  candidates.append({'field':key,'url':value})
+          meta={
+              'status':obj.get('status'),
+              'app_id':info.get('app_id') or '955r139916',
+              'package':info.get('package'),
+              'version_name':info.get('ver_name') or info.get('version_name'),
+              'version_code':info.get('ver_code') or info.get('version_code'),
+              'size':info.get('size'),
+              'sha1':info.get('sha1'),
+              'expires_in':result.get('expires_in'),
+              'candidate_fields':[c['field'] for c in candidates],
+          }
+          Path('analysis/appteka-2094-metadata.json').write_text(json.dumps(meta,indent=2,ensure_ascii=False)+'\n')
+          Path('out/download-candidates.json').write_text(json.dumps(candidates,indent=2)+'\n')
+          if not candidates:
+              raise SystemExit('No download candidate in API response')
+          print(json.dumps(meta,indent=2))
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess, os
+          candidates=json.loads(Path('out/download-candidates.json').read_text())
+          for i,c in enumerate(candidates):
+              out=f'out/candidate-{i}-{c["field"]}.bin'
+              cmd=['curl','-L','--fail-with-body','--retry','4','-A','Appteka/22.1 (Android 14; research-reproduction)',c['url'],'-o',out]
+              print('downloading field',c['field'])
+              rc=subprocess.call(cmd)
+              if rc==0 and Path(out).exists():
+                  print(out,Path(out).stat().st_size)
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, subprocess, zipfile
+          expected='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
+          rows=[]
+          verified=None
+          for p in sorted(Path('out').glob('candidate-*.bin')):
+              data=p.read_bytes()
+              sha=hashlib.sha256(data).hexdigest()
+              is_zip=zipfile.is_zipfile(p)
+              has_manifest=False
+              if is_zip:
+                  with zipfile.ZipFile(p) as z:
+                      has_manifest='AndroidManifest.xml' in z.namelist()
+              row={'file':p.name,'size_bytes':len(data),'sha256':sha,'zip':is_zip,'android_manifest':has_manifest,'expected_hash_match':sha==expected}
+              rows.append(row)
+              if sha==expected and is_zip and has_manifest:
+                  verified=p
+          Path('analysis/appteka-2094-download-verification.json').write_text(json.dumps(rows,indent=2)+'\n')
+          if verified is None:
+              raise SystemExit('No candidate matched the authenticated expected SHA-256')
+          target=Path('out/CallApp-2.094-2094-verified.apk')
+          verified.replace(target)
+          Path('out/VERIFIED').write_text('sha256='+expected+'\n')
+          print('VERIFIED',target)
+          PY
+
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose --print-certs out/CallApp-2.094-2094-verified.apk | tee out/apksigner.txt
+          fi
+          if command -v aapt >/dev/null 2>&1; then
+            aapt dump badging out/CallApp-2.094-2094-verified.apk | head -40 | tee out/aapt-badging.txt
+          fi
+          sha256sum out/CallApp-2.094-2094-verified.apk | tee out/sha256.txt
+
+      - name: Upload verified positive control
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-2094-verified
+          path: |
+            out/CallApp-2.094-2094-verified.apk
+            out/sha256.txt
+            out/apksigner.txt
+            out/aapt-badging.txt
+            out/info.json
+            analysis/appteka-2094-metadata.json
+            analysis/appteka-2094-download-verification.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish verification metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/appteka-2094-metadata.json analysis/appteka-2094-download-verification.json
+          git commit -m 'Verify exact CallApp 2.094 positive control' || exit 0
+          git push

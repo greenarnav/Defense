@@ -1,0 +1,140 @@
+name: Recover CallApp 2.094 APKMirror bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-apkmirror-bundle.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install APK parser
+        run: python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+
+      - name: Fetch APKMirror download page and candidate bundle
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p out analysis
+          PAGE='https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/'
+          DL='https://www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-android-apk-download/download/?key=d020aaceb41dfb5bfa84e4afcc63e75e3272372a'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          curl -L --fail-with-body --retry 4 -A "$UA" -c out/cookies.txt -b out/cookies.txt "$PAGE" -o out/page.html || true
+          curl -L --fail-with-body --retry 4 -A "$UA" -e "$PAGE" -c out/cookies.txt -b out/cookies.txt "$DL" -o out/download-page.html || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import html,json,re,urllib.parse
+          rows=[]
+          for f in ('out/page.html','out/download-page.html'):
+              p=Path(f)
+              if not p.exists(): continue
+              text=html.unescape(p.read_text('utf-8',errors='replace')).replace('\\/','/')
+              links=[]
+              for pat in [r'https?://[^\s"\'<>]+',r'(?:href|src|data-url|data-href|action)=["\']([^"\']+)']:
+                  for m in re.finditer(pat,text,re.I):
+                      v=m.group(1) if m.lastindex else m.group(0)
+                      v=urllib.parse.urljoin('https://www.apkmirror.com/',v)
+                      low=v.lower()
+                      if any(x in low for x in ('downloadr','forcebaseapk','.apkm','.apk','download.php','key=')):
+                          links.append(v.rstrip('),;'))
+              unique=[]; seen=set()
+              for v in links:
+                  if v not in seen: seen.add(v); unique.append(v)
+              rows.append({'file':f,'bytes':p.stat().st_size,'links':unique[:500]})
+          Path('analysis/apkmirror-bundle-links.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,subprocess,zipfile,urllib.parse
+          rows=json.loads(Path('analysis/apkmirror-bundle-links.json').read_text())
+          links=[]
+          for r in rows: links.extend(r['links'])
+          seen=set(); links=[u for u in links if not (u in seen or seen.add(u))]
+          results=[]
+          for i,u in enumerate(links[:80]):
+              p=Path(f'out/candidate-{i:03d}.bin')
+              rc=subprocess.call(['curl','-L','--fail-with-body','--retry','3','-A','Mozilla/5.0','-e','https://www.apkmirror.com/',u,'-o',str(p)])
+              size=p.stat().st_size if p.exists() else 0
+              sha=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+              iszip=zipfile.is_zipfile(p) if p.exists() else False
+              results.append({'url':u,'exit':rc,'size':size,'sha256':sha,'zip':iszip})
+              if iszip and sha=='c7d4abf65d93f3a208f60ba82d61889eaecff70ccffa8ed072947d0944d48711':
+                  p.replace('out/CallApp-2.094-official.apkm'); Path('out/VERIFIED').write_text('bundle hash matched\n'); break
+              if p.exists() and not iszip: p.unlink()
+          Path('analysis/apkmirror-bundle-probes.json').write_text(json.dumps(results,indent=2)+'\n')
+          print(json.dumps(results,indent=2))
+          PY
+
+          if [ -f out/CallApp-2.094-official.apkm ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,zipfile
+          from androguard.core.apk import APK
+          bundle=Path('out/CallApp-2.094-official.apkm')
+          out=[]
+          with zipfile.ZipFile(bundle) as z:
+              for info in z.infolist():
+                  if info.is_dir() or not info.filename.lower().endswith('.apk'): continue
+                  data=z.read(info); target=Path('out')/Path(info.filename).name; target.write_bytes(data)
+                  apk=APK(str(target)); blobs=[]
+                  for name in ('get_certificates_der_v3','get_certificates_der_v2','get_certificates_der_v1'):
+                      fn=getattr(apk,name,None)
+                      if fn:
+                          try: blobs.extend(list(fn() or []))
+                          except Exception: pass
+                  certs=sorted({hashlib.sha256(bytes(x)).hexdigest() for x in blobs})
+                  out.append({'entry':info.filename,'size':len(data),'md5':hashlib.md5(data).hexdigest(),'sha256':hashlib.sha256(data).hexdigest(),'package':apk.get_package(),'version_name':apk.get_androidversion_name(),'version_code':apk.get_androidversion_code(),'certificate_sha256':certs})
+          Path('analysis/apkmirror-bundle-contents.json').write_text(json.dumps(out,indent=2)+'\n')
+          print(json.dumps(out,indent=2))
+          PY
+          fi
+
+      - name: Upload official bundle privately
+        if: ${{ hashFiles('out/VERIFIED') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-official-apkmirror-bundle
+          path: |
+            out/CallApp-2.094-official.apkm
+            out/VERIFIED
+            analysis/apkmirror-bundle-contents.json
+          retention-days: 7
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-apkmirror-bundle-research
+          path: |
+            out/page.html
+            out/download-page.html
+            analysis/apkmirror-bundle-links.json
+            analysis/apkmirror-bundle-probes.json
+            analysis/apkmirror-bundle-contents.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish recovery result
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/apkmirror-bundle-links.json analysis/apkmirror-bundle-probes.json analysis/apkmirror-bundle-contents.json || true
+          git commit -m 'Record APKMirror bundle recovery result' || exit 0
+          git push

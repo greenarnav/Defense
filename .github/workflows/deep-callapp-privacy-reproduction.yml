@@ -1,0 +1,245 @@
+name: Deep CallApp privacy reproduction
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deep-callapp-privacy-reproduction.yml'
+      - 'tools/deep_privacy_audit.py.gz.b64'
+
+permissions:
+  contents: write
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      OLD_EXPECTED_SHA256: 047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525
+      OLD_EXPECTED_CERT_SHA256: 5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5
+      CURRENT_EXPECTED_XAPK_SHA256: 5efbc286c10d387d2d179a87a08ed1dbaff8598daeaeaa7857ff8d39da8d7da9
+      CURRENT_EXPECTED_BASE_SHA256: 2c17e9da2ecf62e036841c17f0e6c28586ac6983419cf08d2b43a26a5a5fa316
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+          mkdir -p tools downloads/old downloads/current logs work results analysis
+          base64 -d tools/deep_privacy_audit.py.gz.b64 | gzip -dc > tools/deep_privacy_audit.py
+          python -m py_compile tools/deep_privacy_audit.py
+
+          curl -L --fail --retry 4 \
+            -o tools/apkeep \
+            https://github.com/EFForg/apkeep/releases/download/1.0.0/apkeep-x86_64-unknown-linux-gnu
+          chmod +x tools/apkeep
+          tools/apkeep --version | tee logs/apkeep-version.txt
+
+          curl -L --fail --retry 4 \
+            -o tools/jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q tools/jadx.zip -d tools/jadx
+          tools/jadx/bin/jadx --version | tee logs/jadx-version.txt
+
+          curl -L --fail --retry 4 \
+            -o tools/Priv_impl.json \
+            https://raw.githubusercontent.com/1phan/PICOSCAN/main/data/privacy-apis/Priv_impl.json
+          sha256sum tools/Priv_impl.json | tee logs/pico-metadb-sha256.txt
+
+      - name: Recover authenticated CallApp 2.094 positive control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          UA='Appteka/22.1 (Android 14; research-reproduction)'
+          BASE='https://appteka.store/api/1/app/info'
+          APP_ID='955r139916'
+          COMMON=(
+            -H "User-Agent: $UA"
+            -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
+            -H 'X-App-Package: com.tomclaw.appsend'
+            -H 'X-App-Version-Name: 22.1'
+            -H 'X-App-Version-Code: 1095'
+            -H 'X-App-Signature: research'
+            -H 'X-Android-Version: 34'
+            -H 'X-Android-Release: 14'
+            -H 'X-Device-Manufacturer: Google'
+            -H 'X-Device-Model: Pixel 6'
+            -H 'X-Locale: en-US'
+            -H 'X-Theme: light'
+            -H 'X-Timezone: UTC'
+            -H 'X-Local-Time: 2026-08-19T01:00:00Z'
+            -H 'Accept: application/json'
+          )
+          curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
+            --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' \
+            -o downloads/old/info.json
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          obj=json.loads(Path('downloads/old/info.json').read_text())
+          r=obj.get('result') or {}
+          candidates=[r.get(k) for k in ('link','url','download_url','file_url')]
+          candidates=[x for x in candidates if isinstance(x,str) and x.startswith(('http://','https://'))]
+          if not candidates: raise SystemExit('No Appteka download URL')
+          Path('downloads/old/url.txt').write_text(candidates[0])
+          meta={
+            'status':obj.get('status'), 'app_id':(r.get('info') or {}).get('app_id') or '955r139916',
+            'version_name':(r.get('info') or {}).get('ver_name'),
+            'version_code':(r.get('info') or {}).get('ver_code'),
+            'package':(r.get('info') or {}).get('package'),
+            'sha1':(r.get('info') or {}).get('sha1'),
+            'size':(r.get('info') or {}).get('size'),
+          }
+          Path('logs/old-appteka-metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
+          print(json.dumps(meta,indent=2))
+          PY
+          curl -L --fail-with-body --retry 4 -A "$UA" \
+            "$(cat downloads/old/url.txt)" -o downloads/old/CallApp-2.094.apk
+          unzip -t downloads/old/CallApp-2.094.apk > logs/old-unzip-test.txt
+          sha256sum downloads/old/CallApp-2.094.apk | tee logs/old-sha256.txt
+
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose --print-certs downloads/old/CallApp-2.094.apk | tee logs/old-apksigner.txt
+          fi
+          if command -v aapt >/dev/null 2>&1; then
+            aapt dump badging downloads/old/CallApp-2.094.apk | head -50 | tee logs/old-aapt.txt
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, re, subprocess, zipfile
+          p=Path('downloads/old/CallApp-2.094.apk')
+          sha=hashlib.sha256(p.read_bytes()).hexdigest()
+          expected=os.environ['OLD_EXPECTED_SHA256']
+          cert_expected=os.environ['OLD_EXPECTED_CERT_SHA256']
+          cert_text=Path('logs/old-apksigner.txt').read_text(errors='replace') if Path('logs/old-apksigner.txt').exists() else ''
+          certs=re.findall(r'certificate SHA-256 digest:\s*([0-9a-f:]+)',cert_text,re.I)
+          certs=[c.replace(':','').lower() for c in certs]
+          official=(sha==expected) or (cert_expected in certs)
+          status={'sha256':sha,'expected_sha256':expected,'exact_hash_match':sha==expected,'certificate_sha256':certs,'expected_certificate_sha256':cert_expected,'official_signature_match':cert_expected in certs,'accepted_as_positive_control':official}
+          Path('logs/old-authentication.json').write_text(json.dumps(status,indent=2)+'\n')
+          print(json.dumps(status,indent=2))
+          if not official: raise SystemExit('Old APK is not authenticated to the expected CallApp release/signing key')
+          PY
+
+      - name: Download exact current comparison CallApp 2.280
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tools/apkeep -a com.callapp.contacts@2.280 -d apk-pure downloads/current 2>&1 | tee logs/current-download.txt
+          CURRENT_BUNDLE="$(find downloads/current -type f \( -name '*.xapk' -o -name '*.apk' \) | head -1)"
+          test -n "$CURRENT_BUNDLE"
+          cp "$CURRENT_BUNDLE" downloads/current/CallApp-2.280.xapk
+          sha256sum downloads/current/CallApp-2.280.xapk | tee logs/current-xapk-sha256.txt
+          test "$(sha256sum downloads/current/CallApp-2.280.xapk | awk '{print $1}')" = "$CURRENT_EXPECTED_XAPK_SHA256"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile, shutil
+          bundle=Path('downloads/current/CallApp-2.280.xapk')
+          if bundle.suffix.lower()=='.apk':
+              shutil.copy2(bundle,'downloads/current/CallApp-2.280-base.apk')
+          else:
+              with zipfile.ZipFile(bundle) as z:
+                  apks=[i for i in z.infolist() if not i.is_dir() and i.filename.lower().endswith('.apk')]
+                  def score(i):
+                      n=i.filename.lower(); b=Path(n).name; s=i.file_size/1e6
+                      if b=='base.apk': s+=2000
+                      if b=='com.callapp.contacts.apk': s+=1900
+                      if 'base-master' in b: s+=1700
+                      if b.startswith('base-'): s+=1400
+                      if any(x in b for x in ('config.','config_','split_config','dpi','arm64','armeabi','x86')): s-=1800
+                      return s
+                  chosen=max(apks,key=score)
+                  with z.open(chosen) as src, open('downloads/current/CallApp-2.280-base.apk','wb') as dst:
+                      shutil.copyfileobj(src,dst)
+                  Path('logs/current-selected-base.txt').write_text(f'{chosen.filename}\n{chosen.file_size}\n')
+          PY
+          unzip -t downloads/current/CallApp-2.280-base.apk > logs/current-base-unzip-test.txt
+          sha256sum downloads/current/CallApp-2.280-base.apk | tee logs/current-base-sha256.txt
+          test "$(sha256sum downloads/current/CallApp-2.280-base.apk | awk '{print $1}')" = "$CURRENT_EXPECTED_BASE_SHA256"
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose --print-certs downloads/current/CallApp-2.280-base.apk | tee logs/current-apksigner.txt
+          fi
+
+      - name: Decompile both authenticated APKs with JADX
+        shell: bash
+        run: |
+          set +e
+          mkdir -p work/old work/current
+          tools/jadx/bin/jadx --deobf --show-bad-code --threads-count 4 \
+            -d work/old downloads/old/CallApp-2.094.apk > logs/jadx-old.txt 2>&1
+          OLD_RC=$?
+          tools/jadx/bin/jadx --deobf --show-bad-code --threads-count 4 \
+            -d work/current downloads/current/CallApp-2.280-base.apk > logs/jadx-current.txt 2>&1
+          CURRENT_RC=$?
+          set -e
+          printf 'old_rc=%s\ncurrent_rc=%s\n' "$OLD_RC" "$CURRENT_RC" | tee logs/jadx-return-codes.txt
+          test "$(find work/old/sources -name '*.java' | wc -l)" -gt 100
+          test "$(find work/current/sources -name '*.java' | wc -l)" -gt 100
+          find work/old/sources -name '*.java' | wc -l | tee logs/old-java-file-count.txt
+          find work/current/sources -name '*.java' | wc -l | tee logs/current-java-file-count.txt
+
+      - name: Build DEX cross-reference and source evidence report
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > config.json <<'JSON'
+          {
+            "samples": [
+              {"label":"old_2.094","apk":"downloads/old/CallApp-2.094.apk","source_root":"work/old/sources"},
+              {"label":"current_2.280","apk":"downloads/current/CallApp-2.280-base.apk","source_root":"work/current/sources"}
+            ]
+          }
+          JSON
+          python tools/deep_privacy_audit.py \
+            --config config.json \
+            --pico-meta tools/Priv_impl.json \
+            --output results \
+            2>&1 | tee logs/deep-audit.txt
+          cp results/comparison.json analysis/callapp-2.094-vs-2.280-deep-comparison.json
+          cp results/comparison.md analysis/callapp-2.094-vs-2.280-deep-comparison.md
+
+      - name: Create integrity manifest and trim private working data
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find results logs -type f -exec sha256sum {} + | sort > results/artifact-sha256.txt
+          rm -rf downloads work tools/jadx tools/jadx.zip tools/apkeep
+
+      - name: Upload complete reproducibility evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-vs-2.280-deep-reproduction
+          path: |
+            results
+            logs
+            tools/deep_privacy_audit.py
+            tools/Priv_impl.json
+            config.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish concise machine-readable conclusion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/callapp-2.094-vs-2.280-deep-comparison.json analysis/callapp-2.094-vs-2.280-deep-comparison.md
+          git commit -m 'Publish deep CallApp 2.094 versus 2.280 reproduction' || exit 0
+          git push

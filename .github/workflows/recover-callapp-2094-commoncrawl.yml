@@ -1,0 +1,167 @@
+name: Recover CallApp 2.094 through Common Crawl
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-commoncrawl.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Query indexes and recover archived HTML
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p cc/raw analysis
+          cat > cc/recover.py <<'PY'
+          from pathlib import Path
+          import gzip, html, json, re, urllib.parse, urllib.request
+
+          indexes=['CC-MAIN-2023-23','CC-MAIN-2023-26','CC-MAIN-2023-40','CC-MAIN-2023-50','CC-MAIN-2024-10']
+          targets={
+            'page':'www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/callapp-caller-id-block-2-094-2-android-apk-download/*',
+            'release':'www.apkmirror.com/apk/callapp-caller-id-software/caller-id-call-recorder-phone-number-lookup/caller-id-call-recorder-phone-number-lookup-2-094-release/*',
+            'cdn':'downloadr2.apkmirror.com/*com.callapp.contacts_2.094-2094*',
+            'cdn_any':'*.apkmirror.com/*com.callapp.contacts_2.094-2094*',
+          }
+          headers={'User-Agent':'CallApp-PICO-reproduction/1.0'}
+
+          def get(url, hdr=None):
+              req=urllib.request.Request(url,headers=hdr or headers)
+              with urllib.request.urlopen(req,timeout=90) as r: return r.read()
+
+          records=[]
+          for idx in indexes:
+              for label,target in targets.items():
+                  q=urllib.parse.urlencode({'url':target,'output':'json','filter':'status:200','collapse':'digest'})
+                  url=f'https://index.commoncrawl.org/{idx}-index?{q}'
+                  try: raw=get(url).decode('utf-8','replace')
+                  except Exception as exc:
+                      records.append({'index':idx,'label':label,'query_error':str(exc),'query_url':url}); continue
+                  for line in raw.splitlines():
+                      try: row=json.loads(line)
+                      except Exception: continue
+                      row.update({'index':idx,'label':label})
+                      records.append(row)
+          Path('cc/index-records.json').write_text(json.dumps(records,indent=2)+'\n')
+
+          candidates=[]; fetched=[]
+          valid=[r for r in records if r.get('filename') and r.get('offset') and r.get('length')]
+          for n,row in enumerate(valid[:120]):
+              warc='https://data.commoncrawl.org/'+row['filename']
+              start=int(row['offset']); length=int(row['length'])
+              try:
+                  payload=get(warc,{'Range':f'bytes={start}-{start+length-1}','User-Agent':headers['User-Agent']})
+                  try: decoded=gzip.decompress(payload)
+                  except Exception: decoded=payload
+                  text=decoded.decode('utf-8','replace')
+              except Exception as exc:
+                  fetched.append({'url':row.get('url'),'error':str(exc)}); continue
+              out=Path(f'cc/raw/{n:03d}-{row["index"]}-{row["label"]}.txt')
+              out.write_text(text,encoding='utf-8')
+              fetched.append({'url':row.get('url'),'path':str(out),'bytes':len(decoded)})
+              clean=html.unescape(text).replace('\\/','/')
+              patterns=[
+                  r'https?://[^\s"\'<>]+',
+                  r'(?:href|src|data-url|data-href|action)=["\']([^"\']+)',
+              ]
+              for pat in patterns:
+                  for m in re.finditer(pat,clean,re.I):
+                      value=m.group(1) if m.lastindex else m.group(0)
+                      low=value.lower()
+                      if ('apkmirror.com' in low or 'apkmirror' in low) and any(k in low for k in ('2.094','2094','download','forcebaseapk','.apk','wp-content/uploads')):
+                          candidates.append({'source_record':row.get('url'),'index':row['index'],'candidate':value})
+          unique=[]; seen=set()
+          for c in candidates:
+              v=c['candidate'].strip().rstrip('),;')
+              if v not in seen:
+                  seen.add(v); c['candidate']=v; unique.append(c)
+          Path('analysis/commoncrawl-apkmirror-candidates.json').write_text(json.dumps(unique,indent=2)+'\n')
+          Path('analysis/commoncrawl-apkmirror-summary.json').write_text(json.dumps({'records':len(records),'valid_records':len(valid),'fetched':fetched,'candidate_count':len(unique)},indent=2)+'\n')
+          print('records',len(records),'valid',len(valid),'candidates',len(unique))
+          for c in unique[:100]: print(c['candidate'])
+          PY
+          python cc/recover.py | tee cc/recover.log
+
+      - name: Probe candidate APK URLs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,subprocess,urllib.parse,zipfile
+          rows=json.loads(Path('analysis/commoncrawl-apkmirror-candidates.json').read_text())
+          urls=[]
+          for row in rows:
+              u=urllib.parse.urljoin('https://www.apkmirror.com/',row['candidate'])
+              low=u.lower()
+              if any(x in low for x in ('.apk','downloadr','wp-content/uploads','download.php')):
+                  urls.append(u)
+          seen=set(); urls=[u for u in urls if not (u in seen or seen.add(u))]
+          results=[]
+          for i,u in enumerate(urls[:80]):
+              p=Path(f'cc/candidate-{i:03d}.bin')
+              rc=subprocess.call(['curl','-L','--fail-with-body','--retry','2','-A','Mozilla/5.0',u,'-o',str(p)])
+              size=p.stat().st_size if p.exists() else 0
+              sha=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+              apk=False
+              if p.exists() and zipfile.is_zipfile(p):
+                  try:
+                      with zipfile.ZipFile(p) as z: apk='AndroidManifest.xml' in z.namelist()
+                  except Exception: pass
+              results.append({'url':u,'curl_exit':rc,'size':size,'sha256':sha,'apk':apk})
+              if apk and sha=='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525':
+                  p.replace('cc/CallApp-2.094-official.apk'); Path('cc/VERIFIED').write_text('exact hash\n'); break
+              if p.exists() and not apk: p.unlink()
+          Path('analysis/commoncrawl-candidate-probes.json').write_text(json.dumps(results,indent=2)+'\n')
+          print(json.dumps(results,indent=2))
+          PY
+
+      - name: Upload recovered APK privately
+        if: ${{ hashFiles('cc/VERIFIED') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-official-commoncrawl
+          path: |
+            cc/CallApp-2.094-official.apk
+            cc/VERIFIED
+          retention-days: 7
+
+      - name: Upload archive research evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-commoncrawl-research
+          path: |
+            cc/index-records.json
+            cc/recover.log
+            cc/raw
+            analysis/commoncrawl-apkmirror-candidates.json
+            analysis/commoncrawl-apkmirror-summary.json
+            analysis/commoncrawl-candidate-probes.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish sanitized recovery result
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/commoncrawl-apkmirror-candidates.json analysis/commoncrawl-apkmirror-summary.json analysis/commoncrawl-candidate-probes.json || true
+          git commit -m 'Record Common Crawl CallApp recovery result' || exit 0
+          git push

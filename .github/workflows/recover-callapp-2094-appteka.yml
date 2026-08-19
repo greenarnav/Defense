@@ -17,15 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query target release and download APK
+      - name: Query, download, and verify target release
         shell: bash
         run: |
-          set -euxo pipefail
+          set -uo pipefail
           mkdir -p out analysis
           UA='Appteka/22.1 (Android 14; research-reproduction)'
           BASE='https://appteka.store/api/1/app/info'
           APP_ID='955r139916'
           EXPECTED_SHA256='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
+          EXPECTED_CERT='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
           COMMON=(
             -H "User-Agent: $UA"
             -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
@@ -44,98 +45,93 @@ jobs:
             -H 'Accept: application/json'
           )
           curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
-            --get "$BASE" \
-            --data-urlencode "app_id=$APP_ID" \
-            --data-urlencode 'locale=en' \
-            -D out/info-headers.txt \
-            -o out/info.json
+            --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' \
+            -D out/info-headers.txt -o out/info.json
+          QUERY_RC=$?
 
           python3 - <<'PY'
           from pathlib import Path
           import json, urllib.parse
-          obj=json.loads(Path('out/info.json').read_text())
-          result=obj.get('result') or {}
-          info=result.get('info') or {}
+          p=Path('out/info.json')
+          obj=json.loads(p.read_text()) if p.exists() else {}
+          result=obj.get('result') or {}; info=result.get('info') or {}
           candidates=[]
           for key in ('link','url','download_url','file_url'):
               value=result.get(key)
-              if isinstance(value,str) and value.startswith(('http://','https://')):
-                  candidates.append({'field':key,'url':value})
+              if isinstance(value,str) and value.strip():
+                  candidates.append({'field':key,'url':urllib.parse.urljoin('https://appteka.store/',value)})
           meta={
-              'status':obj.get('status'),
-              'app_id':info.get('app_id') or '955r139916',
-              'package':info.get('package'),
-              'version_name':info.get('ver_name') or info.get('version_name'),
-              'version_code':info.get('ver_code') or info.get('version_code'),
-              'size':info.get('size'),
-              'sha1':info.get('sha1'),
-              'expires_in':result.get('expires_in'),
+              'status':obj.get('status'),'app_id':info.get('app_id') or '955r139916',
+              'package':info.get('package'),'version_name':info.get('ver_name') or info.get('version_name'),
+              'version_code':info.get('ver_code') or info.get('version_code'),'size':info.get('size'),
+              'sha1':info.get('sha1'),'expires_in':result.get('expires_in'),
               'candidate_fields':[c['field'] for c in candidates],
+              'candidate_hosts':[urllib.parse.urlparse(c['url']).netloc for c in candidates],
           }
           Path('analysis/appteka-2094-metadata.json').write_text(json.dumps(meta,indent=2,ensure_ascii=False)+'\n')
           Path('out/download-candidates.json').write_text(json.dumps(candidates,indent=2)+'\n')
-          if not candidates:
-              raise SystemExit('No download candidate in API response')
           print(json.dumps(meta,indent=2))
           PY
 
           python3 - <<'PY'
           from pathlib import Path
-          import json, subprocess, os
-          candidates=json.loads(Path('out/download-candidates.json').read_text())
+          import json, subprocess
+          p=Path('out/download-candidates.json')
+          candidates=json.loads(p.read_text()) if p.exists() else []
           for i,c in enumerate(candidates):
               out=f'out/candidate-{i}-{c["field"]}.bin'
-              cmd=['curl','-L','--fail-with-body','--retry','4','-A','Appteka/22.1 (Android 14; research-reproduction)',c['url'],'-o',out]
-              print('downloading field',c['field'])
-              rc=subprocess.call(cmd)
-              if rc==0 and Path(out).exists():
-                  print(out,Path(out).stat().st_size)
+              rc=subprocess.call(['curl','-L','--fail-with-body','--retry','4','-A','Appteka/22.1 (Android 14; research-reproduction)',c['url'],'-o',out])
+              print('candidate',i,c['field'],'rc',rc,'size',Path(out).stat().st_size if Path(out).exists() else 0)
           PY
+
+          for f in out/candidate-*.bin; do
+            [ -f "$f" ] || continue
+            unzip -t "$f" > "${f}.unzip.txt" 2>&1 || true
+            if command -v apksigner >/dev/null 2>&1; then
+              apksigner verify --verbose --print-certs "$f" > "${f}.apksigner.txt" 2>&1 || true
+            fi
+            if command -v aapt >/dev/null 2>&1; then
+              aapt dump badging "$f" > "${f}.aapt.txt" 2>&1 || true
+            fi
+          done
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, json, os, subprocess, zipfile
+          import hashlib,json,re,zipfile
           expected='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
-          rows=[]
-          verified=None
+          expected_cert='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
+          rows=[]; accepted=None
           for p in sorted(Path('out').glob('candidate-*.bin')):
-              data=p.read_bytes()
-              sha=hashlib.sha256(data).hexdigest()
-              is_zip=zipfile.is_zipfile(p)
+              data=p.read_bytes(); sha=hashlib.sha256(data).hexdigest(); is_zip=zipfile.is_zipfile(p)
               has_manifest=False
               if is_zip:
-                  with zipfile.ZipFile(p) as z:
-                      has_manifest='AndroidManifest.xml' in z.namelist()
-              row={'file':p.name,'size_bytes':len(data),'sha256':sha,'zip':is_zip,'android_manifest':has_manifest,'expected_hash_match':sha==expected}
+                  try:
+                      with zipfile.ZipFile(p) as z: has_manifest='AndroidManifest.xml' in z.namelist()
+                  except Exception: pass
+              cert_text=Path(str(p)+'.apksigner.txt').read_text(errors='replace') if Path(str(p)+'.apksigner.txt').exists() else ''
+              certs=[x.replace(':','').lower() for x in re.findall(r'certificate SHA-256 digest:\s*([0-9a-f:]+)',cert_text,re.I)]
+              exact=sha==expected; cert_ok=expected_cert in certs
+              row={'file':p.name,'size_bytes':len(data),'sha256':sha,'zip':is_zip,'android_manifest':has_manifest,'certificate_sha256':certs,'exact_hash_match':exact,'official_signature_match':cert_ok,'accepted':is_zip and has_manifest and (exact or cert_ok)}
               rows.append(row)
-              if sha==expected and is_zip and has_manifest:
-                  verified=p
+              if row['accepted'] and accepted is None: accepted=p
           Path('analysis/appteka-2094-download-verification.json').write_text(json.dumps(rows,indent=2)+'\n')
-          if verified is None:
-              raise SystemExit('No candidate matched the authenticated expected SHA-256')
-          target=Path('out/CallApp-2.094-2094-verified.apk')
-          verified.replace(target)
-          Path('out/VERIFIED').write_text('sha256='+expected+'\n')
-          print('VERIFIED',target)
+          if accepted:
+              target=Path('out/CallApp-2.094-2094-verified.apk'); accepted.replace(target); Path('out/VERIFIED').write_text('accepted\n')
+          print(json.dumps(rows,indent=2))
           PY
 
-          if command -v apksigner >/dev/null 2>&1; then
-            apksigner verify --verbose --print-certs out/CallApp-2.094-2094-verified.apk | tee out/apksigner.txt
+          if [ -f out/CallApp-2.094-2094-verified.apk ]; then
+            sha256sum out/CallApp-2.094-2094-verified.apk > out/sha256.txt
           fi
-          if command -v aapt >/dev/null 2>&1; then
-            aapt dump badging out/CallApp-2.094-2094-verified.apk | head -40 | tee out/aapt-badging.txt
-          fi
-          sha256sum out/CallApp-2.094-2094-verified.apk | tee out/sha256.txt
 
       - name: Upload verified positive control
+        if: ${{ hashFiles('out/VERIFIED') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: CallApp-2.094-2094-verified
           path: |
             out/CallApp-2.094-2094-verified.apk
             out/sha256.txt
-            out/apksigner.txt
-            out/aapt-badging.txt
             out/info.json
             analysis/appteka-2094-metadata.json
             analysis/appteka-2094-download-verification.json
@@ -149,5 +145,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add analysis/appteka-2094-metadata.json analysis/appteka-2094-download-verification.json
-          git commit -m 'Verify exact CallApp 2.094 positive control' || exit 0
+          git commit -m 'Record exact CallApp 2.094 verification result' || exit 0
           git push

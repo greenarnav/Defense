@@ -1,0 +1,131 @@
+name: Recover CallApp 2.094 from Aptoide
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-aptoide.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install APK parser
+        run: python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+
+      - name: Query versions, download, and authenticate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out analysis
+          curl -L --fail-with-body --retry 4 \
+            -A 'Mozilla/5.0 CallApp-PICO-reproduction/1.0' \
+            'https://ws75.aptoide.com/api/7/app/getVersions/package_name=com.callapp.contacts/limit=1000' \
+            -o out/versions.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          obj=json.loads(Path('out/versions.json').read_text())
+          versions=obj.get('list') or obj.get('data',{}).get('list') or []
+          matches=[]
+          for item in versions:
+              f=item.get('file') or {}
+              if str(f.get('vername'))=='2.094' or str(f.get('vercode'))=='2094':
+                  matches.append(item)
+          summary={'returned_versions':len(versions),'matches':[{'id':m.get('id'),'vername':(m.get('file') or {}).get('vername'),'vercode':(m.get('file') or {}).get('vercode'),'sha1':(m.get('file') or {}).get('sha1')} for m in matches]}
+          Path('analysis/aptoide-2094-version-query.json').write_text(json.dumps(summary,indent=2)+'\n')
+          if not matches: raise SystemExit('Aptoide has no 2.094/2094 entry')
+          Path('out/app-id.txt').write_text(str(matches[0]['id']))
+          print(json.dumps(summary,indent=2))
+          PY
+
+          curl -L --fail-with-body --retry 4 \
+            -A 'Mozilla/5.0 CallApp-PICO-reproduction/1.0' \
+            "https://ws2.aptoide.com/api/7/app/getMeta/app_id=$(cat out/app-id.txt)" \
+            -o out/meta.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          obj=json.loads(Path('out/meta.json').read_text())
+          data=obj.get('data') or obj.get('result') or {}
+          f=data.get('file') or {}
+          url=f.get('path') or f.get('path_alt')
+          if not isinstance(url,str) or not url.startswith(('http://','https://')): raise SystemExit('No APK path')
+          Path('out/url.txt').write_text(url)
+          summary={'id':data.get('id'),'name':data.get('name'),'package':data.get('package'),'version_name':f.get('vername'),'version_code':f.get('vercode'),'sha1':f.get('sha1'),'size':data.get('size'),'malware':data.get('malware')}
+          Path('analysis/aptoide-2094-metadata.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          PY
+
+          curl -L --fail-with-body --retry 4 -A 'Mozilla/5.0' "$(cat out/url.txt)" -o out/CallApp-2.094.apk
+          unzip -t out/CallApp-2.094.apk > out/unzip-test.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from androguard.core.apk import APK
+          import hashlib,json
+          p=Path('out/CallApp-2.094.apk'); apk=APK(str(p))
+          blobs=[]
+          for name in ('get_certificates_der_v3','get_certificates_der_v2','get_certificates_der_v1'):
+              fn=getattr(apk,name,None)
+              if fn:
+                  try: blobs.extend(list(fn() or []))
+                  except Exception: pass
+          certs=sorted({hashlib.sha256(bytes(x)).hexdigest() for x in blobs})
+          sha=hashlib.sha256(p.read_bytes()).hexdigest()
+          expected_cert='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
+          expected_hash='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
+          identity=apk.get_package()=='com.callapp.contacts' and str(apk.get_androidversion_name())=='2.094' and str(apk.get_androidversion_code())=='2094'
+          result={'size':p.stat().st_size,'sha256':sha,'certificate_sha256':certs,'package':apk.get_package(),'version_name':apk.get_androidversion_name(),'version_code':apk.get_androidversion_code(),'identity_match':identity,'exact_hash_match':sha==expected_hash,'official_signature_match':expected_cert in certs,'accepted':identity and (sha==expected_hash or expected_cert in certs)}
+          Path('analysis/aptoide-2094-verification.json').write_text(json.dumps(result,indent=2)+'\n')
+          if result['accepted']: Path('out/VERIFIED').write_text('accepted\n')
+          print(json.dumps(result,indent=2))
+          PY
+
+      - name: Upload official APK privately
+        if: ${{ hashFiles('out/VERIFIED') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-official-aptoide
+          path: |
+            out/CallApp-2.094.apk
+            out/VERIFIED
+            analysis/aptoide-2094-verification.json
+          retention-days: 7
+
+      - name: Upload query evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallApp-2.094-aptoide-research
+          path: |
+            out/versions.json
+            out/meta.json
+            analysis/aptoide-2094-version-query.json
+            analysis/aptoide-2094-metadata.json
+            analysis/aptoide-2094-verification.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish result
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/aptoide-2094-version-query.json analysis/aptoide-2094-metadata.json analysis/aptoide-2094-verification.json || true
+          git commit -m 'Record Aptoide CallApp 2.094 recovery result' || exit 0
+          git push

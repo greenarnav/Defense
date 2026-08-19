@@ -1,0 +1,44 @@
+[
+  {
+    "request": "by-package",
+    "kind": "json",
+    "top_keys": [
+      "status",
+      "result"
+    ],
+    "status": 200,
+    "description": null,
+    "version_count": 218,
+    "current_app_id": "9efr305576",
+    "target_matches": [
+      {
+        "app_id": "955r139916",
+        "ver_name": "2.094",
+        "ver_code": 2094,
+        "downloads": 50,
+        "sdk_version": 23
+      }
+    ]
+  },
+  {
+    "request": "by-id",
+    "kind": "json",
+    "top_keys": [
+      "status",
+      "result"
+    ],
+    "status": 200,
+    "description": null,
+    "version_count": 218,
+    "current_app_id": "1dcr163760",
+    "target_matches": [
+      {
+        "app_id": "955r139916",
+        "ver_name": "2.094",
+        "ver_code": 2094,
+        "downloads": 50,
+        "sdk_version": 23
+      }
+    ]
+  }
+]

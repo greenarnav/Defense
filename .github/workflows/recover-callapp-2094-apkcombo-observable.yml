@@ -1,0 +1,105 @@
+name: Observable APKCombo CallApp 2.094 recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-callapp-2094-apkcombo-observable.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish workflow run id
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p analysis
+          printf 'run_id=%s\nrun_attempt=%s\ncommit=%s\n' '${{ github.run_id }}' '${{ github.run_attempt }}' '${{ github.sha }}' > analysis/apkcombo-observable-run-id.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analysis/apkcombo-observable-run-id.txt
+          git commit -m 'Record APKCombo recovery workflow run id'
+          git push
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build downloader and install parser
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 https://github.com/kiber-io/apkdgo.git /tmp/apkdgo
+          cd /tmp/apkdgo
+          go build -o "$GITHUB_WORKSPACE/apkd" ./cmd/apkd
+          cd "$GITHUB_WORKSPACE"
+          ./apkd --version | tee apkd-version.txt || true
+          python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+
+      - name: Download exact APKCombo version code 2094
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out
+          ./apkd -vv -s apkcombo -p com.callapp.contacts:2094 -O out > out/apkd.log 2>&1
+          echo $? > out/apkd-exit.txt
+          find out -type f -printf '%p %s bytes\n' | sort | tee out/files.txt
+          set -e
+
+      - name: Authenticate every APK candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from androguard.core.apk import APK
+          import hashlib,json,zipfile
+          expected_cert='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
+          expected_hash='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
+          rows=[]; accepted=None
+          for p in Path('out').rglob('*'):
+              if not p.is_file() or not zipfile.is_zipfile(p): continue
+              try: apk=APK(str(p))
+              except Exception as exc:
+                  rows.append({'file':str(p),'error':str(exc)}); continue
+              blobs=[]
+              for name in ('get_certificates_der_v3','get_certificates_der_v2','get_certificates_der_v1'):
+                  fn=getattr(apk,name,None)
+                  if fn:
+                      try: blobs.extend(list(fn() or []))
+                      except Exception: pass
+              certs=sorted({hashlib.sha256(bytes(x)).hexdigest() for x in blobs})
+              sha=hashlib.sha256(p.read_bytes()).hexdigest()
+              identity=apk.get_package()=='com.callapp.contacts' and str(apk.get_androidversion_name())=='2.094' and str(apk.get_androidversion_code())=='2094'
+              row={'file':str(p),'size_bytes':p.stat().st_size,'sha256':sha,'certificate_sha256':certs,'package':apk.get_package(),'version_name':apk.get_androidversion_name(),'version_code':apk.get_androidversion_code(),'identity_match':identity,'exact_hash_match':sha==expected_hash,'official_signature_match':expected_cert in certs,'accepted':identity and (sha==expected_hash or expected_cert in certs)}
+              rows.append(row)
+              if row['accepted'] and accepted is None: accepted=p
+          Path('out/verification.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          if accepted:
+              target=Path('out/CallApp-2.094-official.apk')
+              if accepted != target: accepted.replace(target)
+              Path('out/VERIFIED').write_text('accepted\n')
+          PY
+
+      - name: Upload all recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: observable-apkcombo-callapp-2094
+          path: |
+            out
+            apkd-version.txt
+          if-no-files-found: error
+          retention-days: 7

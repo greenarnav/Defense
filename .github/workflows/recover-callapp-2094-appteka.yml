@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install certificate parser
+        run: python -m pip install 'androguard==4.1.3' 'loguru>=0.7,<1'
+
       - name: Query, download, and verify target release
         shell: bash
         run: |
@@ -25,8 +32,6 @@ jobs:
           UA='Appteka/22.1 (Android 14; research-reproduction)'
           BASE='https://appteka.store/api/1/app/info'
           APP_ID='955r139916'
-          EXPECTED_SHA256='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
-          EXPECTED_CERT='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
           COMMON=(
             -H "User-Agent: $UA"
             -H 'X-Device-ID: 00000000-0000-4000-8000-000000000001'
@@ -47,13 +52,11 @@ jobs:
           curl -L --fail-with-body --retry 4 "${COMMON[@]}" \
             --get "$BASE" --data-urlencode "app_id=$APP_ID" --data-urlencode 'locale=en' \
             -D out/info-headers.txt -o out/info.json
-          QUERY_RC=$?
 
           python3 - <<'PY'
           from pathlib import Path
           import json, urllib.parse
-          p=Path('out/info.json')
-          obj=json.loads(p.read_text()) if p.exists() else {}
+          obj=json.loads(Path('out/info.json').read_text())
           result=obj.get('result') or {}; info=result.get('info') or {}
           candidates=[]
           for key in ('link','url','download_url','file_url'):
@@ -76,42 +79,49 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import json, subprocess
-          p=Path('out/download-candidates.json')
-          candidates=json.loads(p.read_text()) if p.exists() else []
+          candidates=json.loads(Path('out/download-candidates.json').read_text())
           for i,c in enumerate(candidates):
               out=f'out/candidate-{i}-{c["field"]}.bin'
               rc=subprocess.call(['curl','-L','--fail-with-body','--retry','4','-A','Appteka/22.1 (Android 14; research-reproduction)',c['url'],'-o',out])
               print('candidate',i,c['field'],'rc',rc,'size',Path(out).stat().st_size if Path(out).exists() else 0)
           PY
 
-          for f in out/candidate-*.bin; do
-            [ -f "$f" ] || continue
-            unzip -t "$f" > "${f}.unzip.txt" 2>&1 || true
-            if command -v apksigner >/dev/null 2>&1; then
-              apksigner verify --verbose --print-certs "$f" > "${f}.apksigner.txt" 2>&1 || true
-            fi
-            if command -v aapt >/dev/null 2>&1; then
-              aapt dump badging "$f" > "${f}.aapt.txt" 2>&1 || true
-            fi
-          done
-
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json,re,zipfile
+          import hashlib,json,zipfile
+          from androguard.core.apk import APK
+
           expected='047810e456e9ed921797a04d27dbc632fa51c301e38e9360712ae12110c1b525'
           expected_cert='5992ac7b1049f2e71d9c981ee0c5c3f92bcae7144c86ee26dd9f9d2b2531f2e5'
           rows=[]; accepted=None
           for p in sorted(Path('out').glob('candidate-*.bin')):
               data=p.read_bytes(); sha=hashlib.sha256(data).hexdigest(); is_zip=zipfile.is_zipfile(p)
-              has_manifest=False
+              has_manifest=False; package=None; version_name=None; version_code=None; certs=[]; parse_error=None
               if is_zip:
                   try:
                       with zipfile.ZipFile(p) as z: has_manifest='AndroidManifest.xml' in z.namelist()
-                  except Exception: pass
-              cert_text=Path(str(p)+'.apksigner.txt').read_text(errors='replace') if Path(str(p)+'.apksigner.txt').exists() else ''
-              certs=[x.replace(':','').lower() for x in re.findall(r'certificate SHA-256 digest:\s*([0-9a-f:]+)',cert_text,re.I)]
+                  except Exception as exc: parse_error=f'zip: {exc}'
+              if is_zip and has_manifest:
+                  try:
+                      apk=APK(str(p))
+                      package=apk.get_package(); version_name=apk.get_androidversion_name(); version_code=apk.get_androidversion_code()
+                      blobs=[]
+                      for name in ('get_certificates_der_v3','get_certificates_der_v2','get_certificates_der_v1'):
+                          fn=getattr(apk,name,None)
+                          if fn:
+                              try: blobs.extend(list(fn() or []))
+                              except Exception: pass
+                      certs=sorted({hashlib.sha256(bytes(blob)).hexdigest() for blob in blobs})
+                  except Exception as exc: parse_error=f'androguard: {exc}'
               exact=sha==expected; cert_ok=expected_cert in certs
-              row={'file':p.name,'size_bytes':len(data),'sha256':sha,'zip':is_zip,'android_manifest':has_manifest,'certificate_sha256':certs,'exact_hash_match':exact,'official_signature_match':cert_ok,'accepted':is_zip and has_manifest and (exact or cert_ok)}
+              identity_ok=package=='com.callapp.contacts' and str(version_name)=='2.094' and str(version_code)=='2094'
+              row={
+                  'file':p.name,'size_bytes':len(data),'sha256':sha,'zip':is_zip,'android_manifest':has_manifest,
+                  'package':package,'version_name':version_name,'version_code':version_code,
+                  'certificate_sha256':certs,'exact_hash_match':exact,'official_signature_match':cert_ok,
+                  'identity_match':identity_ok,'parse_error':parse_error,
+                  'accepted':is_zip and has_manifest and identity_ok and (exact or cert_ok),
+              }
               rows.append(row)
               if row['accepted'] and accepted is None: accepted=p
           Path('analysis/appteka-2094-download-verification.json').write_text(json.dumps(rows,indent=2)+'\n')
@@ -145,5 +155,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add analysis/appteka-2094-metadata.json analysis/appteka-2094-download-verification.json
-          git commit -m 'Record exact CallApp 2.094 verification result' || exit 0
+          git commit -m 'Authenticate exact CallApp 2.094 positive control' || exit 0
           git push

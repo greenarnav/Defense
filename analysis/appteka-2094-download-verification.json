@@ -1,0 +1,24 @@
+[
+  {
+    "file": "candidate-0-link.bin",
+    "size_bytes": 56805712,
+    "sha256": "72be8b470e0c8e4ea2ec6a502f347c008bf6363d7b0016cc0098bc0996c4d57d",
+    "zip": true,
+    "android_manifest": true,
+    "certificate_sha256": [],
+    "exact_hash_match": false,
+    "official_signature_match": false,
+    "accepted": false
+  },
+  {
+    "file": "candidate-1-url.bin",
+    "size_bytes": 131015,
+    "sha256": "33cf7eac5751f6e688cda9a3f222162ac76db71bd040678e40fdc2822f292a20",
+    "zip": false,
+    "android_manifest": false,
+    "certificate_sha256": [],
+    "exact_hash_match": false,
+    "official_signature_match": false,
+    "accepted": false
+  }
+]
